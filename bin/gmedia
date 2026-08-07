@@ -214,14 +214,19 @@ cmd_video() {
     local dur total
     dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$aud")
     total=$(python3 -c "print(f'{float('$dur') + $PAD:.2f}')")
+    # 20ms fades kill boundary clicks; audio is re-encoded once at concat.
+    local fadeout
+    fadeout=$(python3 -c "print(f'{float('$dur') - 0.02:.3f}')")
     ffmpeg -v error -y -loop 1 -framerate 30 -i "frames/slide$n.png" -i "$aud" \
-      -af "apad=pad_dur=$PAD" -t "$total" \
+      -af "afade=t=in:d=0.02,afade=t=out:st=$fadeout:d=0.02,apad=pad_dur=$PAD" -t "$total" \
       -c:v libx264 -tune stillimage -pix_fmt yuv420p -r 30 \
-      -c:a aac -b:a 160k -ar 48000 "segs/slide$n.mp4"
+      -c:a aac -b:a 192k -ar 48000 "segs/slide$n.mp4"
     echo "file 'segs/slide$n.mp4'" >> concat.txt
     echo "slide $n: ${total}s ($aud)"
   done
-  ffmpeg -v error -y -f concat -safe 0 -i concat.txt -c copy "$out"
+  # Video segments are codec-identical (copy); audio is re-encoded into one
+  # continuous stream so AAC priming gaps can't click at slide boundaries.
+  ffmpeg -v error -y -f concat -safe 0 -i concat.txt -c:v copy -c:a aac -b:a 192k "$out"
   ffprobe -v error -show_entries format=duration,size -of default=nw=1 "$out"
   echo "wrote $out"
 }
