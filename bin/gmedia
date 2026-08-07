@@ -1,0 +1,243 @@
+#!/bin/bash
+# gmedia — narrated-video production for HTML slide decks.
+#
+# Usage: gmedia <command> [args]   (run inside a directory with gmedia.conf)
+#
+#   init                  write a gmedia.conf template here
+#   render                render deck slides to frames/slideNN.png
+#   pdf                   export the deck to <deck>.pdf
+#   record [SECS]         record mic to sample.m4a (default 90s) + level check
+#   check FILE            report duration and volume levels of an audio file
+#   tts                   synthesize all slides with TTS_ENGINE into tts/
+#   clone setup           install F5-TTS (+deps) on CLONE_HOST
+#   clone ship FILE       upload a voice sample to CLONE_HOST
+#   clone spans           list candidate reference spans (Whisper, GPU)
+#   clone test N [SLIDE]  synthesize one slide with span N and play it
+#   clone all N [SET]     synthesize every slide with span N into remote SET
+#   clone fetch [SET]     download a remote SET into voice-SET/
+#   video [DIR [OUT]]     assemble video; audio priority: DIR > VOICE_DIR > tts/
+#   clean                 remove frames/ tts/ segs/ concat.txt
+set -euo pipefail
+
+GMEDIA_VERSION=0.1.0
+
+die() { echo "gmedia: $*" >&2; exit 1; }
+
+conf() {
+  [ -f gmedia.conf ] || die "no gmedia.conf here (try: gmedia init)"
+  # shellcheck disable=SC1091
+  source gmedia.conf
+  DECK="${DECK:?gmedia.conf must set DECK}"
+  SLIDES="${SLIDES:?gmedia.conf must set SLIDES}"
+  NARRATION_DIR="${NARRATION_DIR:-narration}"
+  VOICE_DIR="${VOICE_DIR:-voice}"
+  OUT_VIDEO="${OUT_VIDEO:-video.mp4}"
+  PAD="${PAD:-0.9}"
+  TTS_ENGINE="${TTS_ENGINE:-edge}"       # edge | say
+  TTS_VOICE="${TTS_VOICE:-en-US-AndrewMultilingualNeural}"
+  EDGE_TTS_BIN="${EDGE_TTS_BIN:-edge-tts}"
+  CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  CLONE_HOST="${CLONE_HOST:-}"           # e.g. glenn@ai.g8.lo (empty = cloning off)
+  CLONE_DIR="${CLONE_DIR:-voiceclone}"   # remote work dir
+  CLONE_VENV="${CLONE_VENV:-~/.f5venv}"  # remote venv with f5-tts + transformers
+  CLONE_STOP_SERVICE="${CLONE_STOP_SERVICE:-}" # systemd unit to pause for VRAM
+}
+
+nn() { printf "%02d" "$1"; }
+
+cmd_init() {
+  [ -f gmedia.conf ] && die "gmedia.conf already exists"
+  cat > gmedia.conf <<'EOF'
+# gmedia production config (shell syntax). Paths relative to this file.
+DECK=deck.html          # slides addressable as deck.html#N (1-based)
+SLIDES=20
+NARRATION_DIR=narration # slideNN.txt per slide
+VOICE_DIR=voice         # optional human recordings slideNN.(m4a|wav|mp3|aiff)
+OUT_VIDEO=video.mp4
+PAD=0.9                 # silence seconds appended per slide
+TTS_ENGINE=edge         # edge | say
+TTS_VOICE=en-US-AndrewMultilingualNeural
+#EDGE_TTS_BIN=/path/to/edge-tts
+# Voice cloning (optional): a Linux GPU host reachable over ssh
+#CLONE_HOST=user@gpubox
+#CLONE_VENV=~/.f5venv
+#CLONE_STOP_SERVICE=llmpager   # systemd unit to stop during GPU synthesis
+EOF
+  echo "wrote gmedia.conf — edit it, then: gmedia render && gmedia tts && gmedia video"
+}
+
+cmd_render() {
+  conf; mkdir -p frames
+  for i in $(seq 1 "$SLIDES"); do
+    local out="frames/slide$(nn "$i").png"
+    [ -f "$out" ] && continue
+    "$CHROME" --headless=new --disable-gpu --hide-scrollbars \
+      --window-size=1920,1080 --screenshot="$out" \
+      "file://$PWD/$DECK#$i" >/dev/null 2>&1
+    echo "$out"
+  done
+}
+
+cmd_pdf() {
+  conf
+  "$CHROME" --headless=new --disable-gpu --no-pdf-header-footer \
+    --print-to-pdf="$PWD/${DECK%.html}.pdf" "file://$PWD/$DECK" 2>&1 | tail -1
+}
+
+cmd_record() {
+  conf
+  local secs="${1:-90}"
+  echo "recording ${secs}s from the default mic — speak after this line"
+  ffmpeg -v error -y -f avfoundation -i ":0" -t "$secs" -ar 24000 -ac 1 sample.m4a
+  cmd_check sample.m4a
+  echo "if max_volume is quieter than -25 dB the mic isn't really capturing;"
+  echo "check System Settings > Privacy > Microphone and input device/volume."
+}
+
+cmd_check() {
+  local f="${1:?usage: gmedia check FILE}"
+  ffprobe -v error -show_entries format=duration -of csv=p=0 "$f"
+  ffmpeg -i "$f" -af volumedetect -f null - 2>&1 | grep -E "mean_volume|max_volume"
+}
+
+cmd_tts() {
+  conf; mkdir -p tts
+  for i in $(seq 1 "$SLIDES"); do
+    local n; n=$(nn "$i")
+    local txt="$NARRATION_DIR/slide$n.txt"
+    [ -f "$txt" ] || die "missing $txt"
+    if [ "$TTS_ENGINE" = edge ]; then
+      [ -f "tts/slide$n.mp3" ] && continue
+      "$EDGE_TTS_BIN" --voice "$TTS_VOICE" --rate=+3% \
+        --file "$txt" --write-media "tts/slide$n.mp3" >/dev/null 2>&1
+      echo "tts/slide$n.mp3"
+    else
+      [ -f "tts/slide$n.aiff" ] && continue
+      say -v "$TTS_VOICE" -o "tts/slide$n.aiff" -f "$txt"
+      echo "tts/slide$n.aiff"
+    fi
+  done
+}
+
+clone_ssh() { conf; [ -n "$CLONE_HOST" ] || die "CLONE_HOST not set"; ssh -o BatchMode=yes "$CLONE_HOST" "$@"; }
+
+cmd_clone() {
+  local sub="${1:?usage: gmedia clone <setup|ship|spans|test|all|fetch>}"; shift || true
+  case "$sub" in
+  setup)
+    clone_ssh "python3 -m venv $CLONE_VENV 2>/dev/null; $CLONE_VENV/bin/pip install -q f5-tts && echo f5-ready"
+    ;;
+  ship)
+    conf; local f="${1:?usage: gmedia clone ship FILE}"
+    scp -q "$f" "$CLONE_HOST:$CLONE_DIR/memo.src"
+    clone_ssh "mkdir -p $CLONE_DIR && cd $CLONE_DIR && ffmpeg -v error -y -i memo.src -ar 24000 -ac 1 memo.wav && echo shipped"
+    scp -q -r "$NARRATION_DIR" "$CLONE_HOST:$CLONE_DIR/narration"
+    ;;
+  spans)
+    clone_ssh "cd $CLONE_DIR && $CLONE_VENV/bin/python - <<'PYEOF'
+from transformers import pipeline
+import json, subprocess
+asr = pipeline('automatic-speech-recognition', model='openai/whisper-base.en', return_timestamps=True, device='cuda')
+chunks = asr('memo.wav')['chunks']
+cands = []
+for i in range(len(chunks)):
+    t0 = chunks[i]['timestamp'][0]
+    if t0 is None or t0 < 3:
+        continue
+    text, t1 = '', t0
+    for j in range(i, len(chunks)):
+        if chunks[j]['timestamp'][1] is None:
+            break
+        t1 = chunks[j]['timestamp'][1]
+        text += chunks[j]['text']
+        if 9.5 <= t1 - t0 <= 12.0:
+            cands.append((t0, t1, text.strip()))
+            break
+json.dump(cands, open('spans.json', 'w'))
+for k, (t0, t1, text) in enumerate(cands, 1):
+    print(k, round(t0, 1), round(t1, 1), '|', text[:70])
+PYEOF"
+    ;;
+  test)
+    conf; local k="${1:?usage: gmedia clone test SPAN [SLIDE]}"; local slide="${2:-$SLIDES}"
+    local n; n=$(nn "$slide")
+    clone_ssh "cd $CLONE_DIR && $CLONE_VENV/bin/python -c \"
+import json, subprocess
+c = json.load(open('spans.json'))[$k-1]
+subprocess.run(['ffmpeg','-v','error','-y','-i','memo.wav','-ss',str(c[0]),'-to',str(c[1]),'ref.wav'], check=True)
+open('reftext.txt','w').write(c[2])\" && $CLONE_VENV/bin/f5-tts_infer-cli --model F5TTS_v1_Base --ref_audio ref.wav --ref_text \"\$(cat reftext.txt)\" --gen_text \"\$(cat narration/slide$n.txt)\" --output_dir out --output_file test.wav >/dev/null 2>&1 && echo synth-ok"
+    scp -q "$CLONE_HOST:$CLONE_DIR/out/test.wav" /tmp/gmedia-clone-test.wav
+    afplay /tmp/gmedia-clone-test.wav
+    ;;
+  all)
+    conf; local k="${1:?usage: gmedia clone all SPAN [SET]}"; local set="${2:-set$k}"
+    local stop="" start=""
+    if [ -n "$CLONE_STOP_SERVICE" ]; then
+      stop="sudo systemctl stop $CLONE_STOP_SERVICE;"
+      start="sudo systemctl start $CLONE_STOP_SERVICE;"
+    fi
+    clone_ssh "cd $CLONE_DIR && $stop $CLONE_VENV/bin/python -c \"
+import json, subprocess
+c = json.load(open('spans.json'))[$k-1]
+subprocess.run(['ffmpeg','-v','error','-y','-i','memo.wav','-ss',str(c[0]),'-to',str(c[1]),'ref.wav'], check=True)
+open('reftext.txt','w').write(c[2])\" && mkdir -p $set && for f in narration/slide*.txt; do n=\$(basename \$f .txt); $CLONE_VENV/bin/f5-tts_infer-cli --model F5TTS_v1_Base --ref_audio ref.wav --ref_text \"\$(cat reftext.txt)\" --gen_text \"\$(cat \$f)\" --output_dir $set --output_file \$n.wav >/dev/null 2>&1; echo \$n; done; $start echo set-done"
+    ;;
+  fetch)
+    conf; local set="${1:-set1}"
+    mkdir -p "voice-$set"
+    scp -q "$CLONE_HOST:$CLONE_DIR/$set/slide*.wav" "voice-$set/"
+    echo "fetched $(ls "voice-$set" | wc -l | tr -d ' ') files into voice-$set/"
+    ;;
+  *) die "unknown clone subcommand $sub" ;;
+  esac
+}
+
+cmd_video() {
+  conf
+  local vdir="${1:-$VOICE_DIR}" out="${2:-$OUT_VIDEO}"
+  cmd_render >/dev/null
+  mkdir -p segs; rm -f segs/*.mp4 concat.txt
+  for i in $(seq 1 "$SLIDES"); do
+    local n; n=$(nn "$i") aud=""
+    for ext in m4a wav aiff mp3; do
+      [ -f "$vdir/slide$n.$ext" ] && aud="$vdir/slide$n.$ext" && break
+    done
+    if [ -z "$aud" ]; then
+      for ext in m4a wav aiff mp3; do
+        [ -f "$VOICE_DIR/slide$n.$ext" ] && aud="$VOICE_DIR/slide$n.$ext" && break
+      done
+    fi
+    [ -z "$aud" ] && for ext in mp3 aiff; do
+      [ -f "tts/slide$n.$ext" ] && aud="tts/slide$n.$ext" && break
+    done
+    [ -n "$aud" ] || die "no audio for slide $n (run gmedia tts, or add $vdir/slide$n.*)"
+    local dur total
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$aud")
+    total=$(python3 -c "print(f'{float('$dur') + $PAD:.2f}')")
+    ffmpeg -v error -y -loop 1 -framerate 30 -i "frames/slide$n.png" -i "$aud" \
+      -af "apad=pad_dur=$PAD" -t "$total" \
+      -c:v libx264 -tune stillimage -pix_fmt yuv420p -r 30 \
+      -c:a aac -b:a 160k -ar 48000 "segs/slide$n.mp4"
+    echo "file 'segs/slide$n.mp4'" >> concat.txt
+    echo "slide $n: ${total}s ($aud)"
+  done
+  ffmpeg -v error -y -f concat -safe 0 -i concat.txt -c copy "$out"
+  ffprobe -v error -show_entries format=duration,size -of default=nw=1 "$out"
+  echo "wrote $out"
+}
+
+cmd_clean() { rm -rf frames tts segs concat.txt; echo cleaned; }
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
+  render) shift; cmd_render "$@" ;;
+  pdf) shift; cmd_pdf "$@" ;;
+  record) shift; cmd_record "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  tts) shift; cmd_tts "$@" ;;
+  clone) shift; cmd_clone "$@" ;;
+  video) shift; cmd_video "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  version|--version) echo "gmedia $GMEDIA_VERSION" ;;
+  *) grep '^#' "$0" | sed -n '2,25p' | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

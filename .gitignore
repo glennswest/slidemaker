@@ -1,0 +1,28 @@
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key
+
+# Production artifacts (per-project, never in the tool repo)
+frames/
+tts/
+segs/
+voice/
+voice-*/
+concat.txt
+*.mp4
+*.m4a
+*.wav
+*.aiff
+*.mp3
+sample.*
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and temp
+*.log
+tmp/
