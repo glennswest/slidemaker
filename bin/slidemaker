@@ -48,7 +48,12 @@ conf() {
   CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
   CLONE_HOST="${CLONE_HOST:-}"           # e.g. glenn@ai.g8.lo (empty = cloning off)
   CLONE_DIR="${CLONE_DIR:-voiceclone}"   # remote work dir
-  CLONE_VENV="${CLONE_VENV:-~/.f5venv}"  # remote venv with f5-tts + transformers
+  CLONE_VENV="${CLONE_VENV:-\$HOME/.f5venv}"  # remote venv: f5-tts + transformers
+  # `CLONE_VENV=~/.f5venv` in a conf file is expanded by the *local* shell at
+  # source time, so the GPU host would be handed this Mac's home directory.
+  # Hand the remote shell a literal $HOME to expand itself.
+  CLONE_VENV="${CLONE_VENV/#$HOME/\$HOME}"
+  CLONE_VENV="${CLONE_VENV/#\~/\$HOME}"
   CLONE_STOP_SERVICE="${CLONE_STOP_SERVICE:-}" # systemd unit to pause for VRAM
   # Excitement curve (see slidemaker-prosody). off = the old flat one-shot TTS.
   EXCITEMENT="${EXCITEMENT:-curve}"      # curve | off
@@ -191,6 +196,7 @@ cmd_clone() {
   local sub="${1:?usage: slidemaker clone <setup|ship|spans|test|all|fetch>}"; shift || true
   case "$sub" in
   setup)
+    conf
     clone_ssh "python3 -m venv $CLONE_VENV 2>/dev/null; $CLONE_VENV/bin/pip install -q f5-tts && echo f5-ready"
     ;;
   ship)
@@ -242,6 +248,7 @@ open('refs/$name.txt','w').write(c[2])
 print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
     ;;
   bands)
+    conf
     clone_ssh "cd $CLONE_DIR && for b in calm mid hot; do
       if [ -f refs/\$b.wav ]; then
         printf '%-5s %5.1fs  ' \$b \$(ffprobe -v error -show_entries format=duration -of csv=p=0 refs/\$b.wav)

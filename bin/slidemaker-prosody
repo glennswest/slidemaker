@@ -76,6 +76,9 @@ class Config:
         self.gap = _pair('SM_E_GAP', '0.34:0.15')    # seconds between sentences
         self.jitter = (os.environ.get('SM_E_JITTER', 'on').lower()
                        not in ('off', '0', 'false', 'no'))
+        # How hard the slew limiter holds continuity: 0 pins every acoustic
+        # parameter flat, 1 lets the curve move at full requested speed.
+        self.slew = float(os.environ.get('SM_E_SLEW', '1.0'))
         self.rise = float(os.environ.get('SM_E_RISE', '0.10'))
         self.max_words = int(os.environ.get('SM_E_MAX_WORDS', '32'))
 
@@ -332,6 +335,40 @@ def plan_slide(cfg, index, curve):
         s['gap'] = 0.0 if nxt is None else round(max(gap, 0.08), 2)
         s['why'] = ','.join(why) or '-'
         s['band'] = band_for(e)
+    return slew(segs, cfg)
+
+
+def slew(segs, cfg):
+    """Rate-limit every parameter the ear hears as continuity.
+
+    A curve is a statement of intent, not a set of instructions the renderer
+    must follow literally. Jumping the acoustic parameters from one sentence
+    to the next is what produces the effect of the speaker being swapped
+    mid-paragraph — the uncanny quality that is worse than a flat read.
+
+    So the requested value is a target and each parameter walks toward it at
+    a bounded rate. Big changes still happen, they just take a sentence or
+    two to arrive, which is also how a real speaker's energy moves.
+
+    Pauses are deliberately NOT limited: silence has no timbre, so a pause
+    may change length freely. That is why the pause rules carry most of the
+    expression here and the acoustic parameters carry little.
+    """
+    if len(segs) < 2:
+        return segs
+    k = cfg.slew
+    limits = {'rate': 3.0 * k, 'pitch': 1.5 * k, 'volume': 3.0 * k,
+              'speed': 0.03 * k}
+    for i in range(1, len(segs)):
+        prev, cur = segs[i - 1], segs[i]
+        for key, lim in limits.items():
+            delta = cur[key] - prev[key]
+            if abs(delta) > lim:
+                cur[key] = prev[key] + math.copysign(lim, delta)
+        cur['rate'] = round(cur['rate'])
+        cur['pitch'] = round(cur['pitch'])
+        cur['volume'] = round(cur['volume'])
+        cur['speed'] = round(cur['speed'], 3)
     return segs
 
 
