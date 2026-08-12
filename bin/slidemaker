@@ -1,14 +1,16 @@
 #!/bin/bash
-# gmedia — narrated-video production for HTML slide decks.
+# slidemaker — narrated-video production for HTML slide decks.
 #
-# Usage: gmedia <command> [args]   (run inside a directory with gmedia.conf)
+# Usage: slidemaker <command> [args]   (run inside a directory with slidemaker.conf)
 #
-#   init                  write a gmedia.conf template here
+#   init                  write a slidemaker.conf template here
 #   render                render deck slides to frames/slideNN.png
 #   pdf                   export the deck to <deck>.pdf
 #   record [SECS]         record mic to sample.m4a (default 90s) + level check
 #   check FILE            report duration and volume levels of an audio file
-#   tts                   synthesize all slides with TTS_ENGINE into tts/
+#   curve [init]          show the excitement curve; init seeds curve.tsv
+#   tts [--force]         synthesize all slides with TTS_ENGINE into tts/
+#   prosody [DIR]         measure built audio — rate and loudness variation
 #   clone setup           install F5-TTS (+deps) on CLONE_HOST
 #   clone ship FILE       upload a voice sample to CLONE_HOST
 #   clone spans           list candidate reference spans (Whisper, GPU)
@@ -19,16 +21,20 @@
 #   clean                 remove frames/ tts/ segs/ concat.txt
 set -euo pipefail
 
-GMEDIA_VERSION=0.1.0
+SLIDEMAKER_VERSION=0.2.0
+PROSODY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/slidemaker-prosody"
 
-die() { echo "gmedia: $*" >&2; exit 1; }
+die() { echo "slidemaker: $*" >&2; exit 1; }
 
 conf() {
-  [ -f gmedia.conf ] || die "no gmedia.conf here (try: gmedia init)"
-  # shellcheck disable=SC1091
-  source gmedia.conf
-  DECK="${DECK:?gmedia.conf must set DECK}"
-  SLIDES="${SLIDES:?gmedia.conf must set SLIDES}"
+  local f=slidemaker.conf
+  # gmedia.conf is the pre-rename name; existing productions keep working.
+  [ -f "$f" ] || f=gmedia.conf
+  [ -f "$f" ] || die "no slidemaker.conf here (try: slidemaker init)"
+  # shellcheck disable=SC1090
+  source "$f"
+  DECK="${DECK:?slidemaker.conf must set DECK}"
+  SLIDES="${SLIDES:?slidemaker.conf must set SLIDES}"
   NARRATION_DIR="${NARRATION_DIR:-narration}"
   VOICE_DIR="${VOICE_DIR:-voice}"
   OUT_VIDEO="${OUT_VIDEO:-video.mp4}"
@@ -41,14 +47,33 @@ conf() {
   CLONE_DIR="${CLONE_DIR:-voiceclone}"   # remote work dir
   CLONE_VENV="${CLONE_VENV:-~/.f5venv}"  # remote venv with f5-tts + transformers
   CLONE_STOP_SERVICE="${CLONE_STOP_SERVICE:-}" # systemd unit to pause for VRAM
+  # Excitement curve (see slidemaker-prosody). off = the old flat one-shot TTS.
+  EXCITEMENT="${EXCITEMENT:-curve}"      # curve | off
+  CURVE_FILE="${CURVE_FILE:-curve.tsv}"  # inside NARRATION_DIR
+  CURVE_DEFAULT="${CURVE_DEFAULT:-auto}" # auto | 0.0-1.0
+  E_RATE="${E_RATE:--3:16}"              # percent   at energy 0 : 1
+  E_PITCH="${E_PITCH:--4:14}"            # Hz        at energy 0 : 1
+  E_VOLUME="${E_VOLUME:-0:8}"            # percent   at energy 0 : 1
+  E_GAP="${E_GAP:-0.34:0.15}"            # seconds between sentences, 0 : 1
+  E_JITTER="${E_JITTER:-on}"
+  CLONE_SPANS="${CLONE_SPANS:-}"         # calm,mid,hot reference spans
+}
+
+# Export config for the Python prosody engine.
+prosody_env() {
+  export SM_NARRATION_DIR="$NARRATION_DIR" SM_TTS_DIR=tts SM_SLIDES="$SLIDES" \
+         SM_TTS_VOICE="$TTS_VOICE" SM_EDGE_TTS_BIN="$EDGE_TTS_BIN" \
+         SM_CURVE_FILE="$CURVE_FILE" SM_CURVE_DEFAULT="$CURVE_DEFAULT" \
+         SM_E_RATE="$E_RATE" SM_E_PITCH="$E_PITCH" SM_E_VOLUME="$E_VOLUME" \
+         SM_E_GAP="$E_GAP" SM_E_JITTER="$E_JITTER"
 }
 
 nn() { printf "%02d" "$1"; }
 
 cmd_init() {
-  [ -f gmedia.conf ] && die "gmedia.conf already exists"
-  cat > gmedia.conf <<'EOF'
-# gmedia production config (shell syntax). Paths relative to this file.
+  [ -f slidemaker.conf ] && die "slidemaker.conf already exists"
+  cat > slidemaker.conf <<'EOF'
+# slidemaker production config (shell syntax). Paths relative to this file.
 DECK=deck.html          # slides addressable as deck.html#N (1-based)
 SLIDES=20
 NARRATION_DIR=narration # slideNN.txt per slide
@@ -58,12 +83,27 @@ PAD=0.9                 # silence seconds appended per slide
 TTS_ENGINE=edge         # edge | say
 TTS_VOICE=en-US-AndrewMultilingualNeural
 #EDGE_TTS_BIN=/path/to/edge-tts
+
+# Excitement curve — the difference between narration and a robot reading.
+# Energy 0.0-1.0 per sentence drives rate, pitch, volume and pause length.
+# Sources, highest first: [e=..] markers in the narration text, then
+# NARRATION_DIR/curve.tsv, then CURVE_DEFAULT.
+EXCITEMENT=curve        # curve | off (off = one flat pass per slide)
+CURVE_DEFAULT=auto      # auto talk arc, or a fixed 0.0-1.0
+#CURVE_FILE=curve.tsv
+#E_RATE=-3:16           # speech rate percent at energy 0 : 1
+#E_PITCH=-4:14          # pitch Hz at energy 0 : 1
+#E_VOLUME=0:8           # volume percent at energy 0 : 1
+#E_GAP=0.34:0.15        # pause seconds between sentences at energy 0 : 1
+#E_JITTER=on            # per-sentence micro-variation (deterministic)
+
 # Voice cloning (optional): a Linux GPU host reachable over ssh
 #CLONE_HOST=user@gpubox
 #CLONE_VENV=~/.f5venv
 #CLONE_STOP_SERVICE=llmpager   # systemd unit to stop during GPU synthesis
+#CLONE_SPANS=3,7,11            # calm,mid,hot reference spans by energy band
 EOF
-  echo "wrote gmedia.conf — edit it, then: gmedia render && gmedia tts && gmedia video"
+  echo "wrote slidemaker.conf — edit it, then: slidemaker render && slidemaker tts && slidemaker video"
 }
 
 cmd_render() {
@@ -95,13 +135,23 @@ cmd_record() {
 }
 
 cmd_check() {
-  local f="${1:?usage: gmedia check FILE}"
+  local f="${1:?usage: slidemaker check FILE}"
   ffprobe -v error -show_entries format=duration -of csv=p=0 "$f"
   ffmpeg -i "$f" -af volumedetect -f null - 2>&1 | grep -E "mean_volume|max_volume"
 }
 
+cmd_curve() {
+  conf; prosody_env
+  if [ "${1:-}" = init ]; then shift; "$PROSODY" curve-init "$@"; else "$PROSODY" plan "$@"; fi
+}
+
+cmd_prosody() { conf; prosody_env; "$PROSODY" report "$@"; }
+
 cmd_tts() {
   conf; mkdir -p tts
+  if [ "$TTS_ENGINE" = edge ] && [ "$EXCITEMENT" != off ]; then
+    prosody_env; "$PROSODY" synth "$@"; return
+  fi
   for i in $(seq 1 "$SLIDES"); do
     local n; n=$(nn "$i")
     local txt="$NARRATION_DIR/slide$n.txt"
@@ -122,13 +172,13 @@ cmd_tts() {
 clone_ssh() { conf; [ -n "$CLONE_HOST" ] || die "CLONE_HOST not set"; ssh -o BatchMode=yes "$CLONE_HOST" "$@"; }
 
 cmd_clone() {
-  local sub="${1:?usage: gmedia clone <setup|ship|spans|test|all|fetch>}"; shift || true
+  local sub="${1:?usage: slidemaker clone <setup|ship|spans|test|all|fetch>}"; shift || true
   case "$sub" in
   setup)
     clone_ssh "python3 -m venv $CLONE_VENV 2>/dev/null; $CLONE_VENV/bin/pip install -q f5-tts && echo f5-ready"
     ;;
   ship)
-    conf; local f="${1:?usage: gmedia clone ship FILE}"
+    conf; local f="${1:?usage: slidemaker clone ship FILE}"
     scp -q "$f" "$CLONE_HOST:$CLONE_DIR/memo.src"
     clone_ssh "mkdir -p $CLONE_DIR && cd $CLONE_DIR && ffmpeg -v error -y -i memo.src -ar 24000 -ac 1 memo.wav && echo shipped"
     scp -q -r "$NARRATION_DIR" "$CLONE_HOST:$CLONE_DIR/narration"
@@ -159,18 +209,18 @@ for k, (t0, t1, text) in enumerate(cands, 1):
 PYEOF"
     ;;
   test)
-    conf; local k="${1:?usage: gmedia clone test SPAN [SLIDE]}"; local slide="${2:-$SLIDES}"
+    conf; local k="${1:?usage: slidemaker clone test SPAN [SLIDE]}"; local slide="${2:-$SLIDES}"
     local n; n=$(nn "$slide")
     clone_ssh "cd $CLONE_DIR && $CLONE_VENV/bin/python -c \"
 import json, subprocess
 c = json.load(open('spans.json'))[$k-1]
 subprocess.run(['ffmpeg','-v','error','-y','-i','memo.wav','-ss',str(c[0]),'-to',str(c[1]),'ref.wav'], check=True)
 open('reftext.txt','w').write(c[2])\" && $CLONE_VENV/bin/f5-tts_infer-cli --model F5TTS_v1_Base --ref_audio ref.wav --ref_text \"\$(cat reftext.txt)\" --gen_text \"\$(cat narration/slide$n.txt)\" --output_dir out --output_file test.wav >/dev/null 2>&1 && echo synth-ok"
-    scp -q "$CLONE_HOST:$CLONE_DIR/out/test.wav" /tmp/gmedia-clone-test.wav
-    afplay /tmp/gmedia-clone-test.wav
+    scp -q "$CLONE_HOST:$CLONE_DIR/out/test.wav" /tmp/slidemaker-clone-test.wav
+    afplay /tmp/slidemaker-clone-test.wav
     ;;
   all)
-    conf; local k="${1:?usage: gmedia clone all SPAN [SET]}"; local set="${2:-set$k}"
+    conf; local k="${1:?usage: slidemaker clone all SPAN [SET]}"; local set="${2:-set$k}"
     local stop="" start=""
     if [ -n "$CLONE_STOP_SERVICE" ]; then
       stop="sudo systemctl stop $CLONE_STOP_SERVICE;"
@@ -210,7 +260,7 @@ cmd_video() {
     [ -z "$aud" ] && for ext in mp3 aiff; do
       [ -f "tts/slide$n.$ext" ] && aud="tts/slide$n.$ext" && break
     done
-    [ -n "$aud" ] || die "no audio for slide $n (run gmedia tts, or add $vdir/slide$n.*)"
+    [ -n "$aud" ] || die "no audio for slide $n (run slidemaker tts, or add $vdir/slide$n.*)"
     local dur total
     dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$aud")
     total=$(python3 -c "print(f'{float('$dur') + $PAD:.2f}')")
@@ -239,10 +289,12 @@ case "${1:-}" in
   pdf) shift; cmd_pdf "$@" ;;
   record) shift; cmd_record "$@" ;;
   check) shift; cmd_check "$@" ;;
+  curve) shift; cmd_curve "$@" ;;
   tts) shift; cmd_tts "$@" ;;
+  prosody) shift; cmd_prosody "$@" ;;
   clone) shift; cmd_clone "$@" ;;
   video) shift; cmd_video "$@" ;;
   clean) shift; cmd_clean "$@" ;;
-  version|--version) echo "gmedia $GMEDIA_VERSION" ;;
+  version|--version) echo "slidemaker $SLIDEMAKER_VERSION" ;;
   *) grep '^#' "$0" | sed -n '2,25p' | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
