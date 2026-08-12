@@ -15,6 +15,7 @@
 #   clone ship FILE       upload a voice sample to CLONE_HOST
 #   clone spans [SRC]     list candidate reference spans (Whisper, GPU)
 #   clone band B SRC N    register span N as energy band B (calm|mid|hot)
+#   clone ref SRC T0 T1   cut the speaker prompt (indextts, no transcript)
 #   clone bands           show the registered energy bands
 #   clone curve [SET]     render the excitement curve in your cloned voice
 #   clone test N [SLIDE]  synthesize one slide with span N and play it
@@ -55,6 +56,13 @@ conf() {
   CLONE_VENV="${CLONE_VENV/#$HOME/\$HOME}"
   CLONE_VENV="${CLONE_VENV/#\~/\$HOME}"
   CLONE_STOP_SERVICE="${CLONE_STOP_SERVICE:-}" # systemd unit to pause for VRAM
+  # f5       — timbre and emotion are the same knob (the reference clip), so
+  #            the curve can only pick a reference per slide.
+  # indextts — speaker prompt and emotion vector are separate inputs, so the
+  #            curve drives emotion with your voice held fixed.
+  CLONE_ENGINE="${CLONE_ENGINE:-f5}"     # f5 | indextts
+  INDEXTTS_DIR="${INDEXTTS_DIR:-index-tts}"   # checkout on CLONE_HOST
+  CLONE_REF="${CLONE_REF:-refs/speaker.wav}"  # speaker prompt (indextts)
   # Excitement curve (see slidemaker-prosody). off = the old flat one-shot TTS.
   EXCITEMENT="${EXCITEMENT:-curve}"      # curve | off
   CURVE_FILE="${CURVE_FILE:-curve.tsv}"  # inside NARRATION_DIR
@@ -256,23 +264,43 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
       else echo \"\$b   (not set)\"; fi
     done"
     ;;
+  ref)
+    # Cut a speaker prompt. IndexTTS-2 needs no transcript for this — it
+    # takes identity from the audio alone — so any clean stretch will do.
+    conf
+    local src="${1:?usage: slidemaker clone ref SOURCE START END}"
+    local t0="${2:?usage: slidemaker clone ref SOURCE START END}"
+    local t1="${3:?usage: slidemaker clone ref SOURCE START END}"
+    clone_ssh "cd $CLONE_DIR && mkdir -p refs && ffmpeg -v error -y -i $src.wav -ss $t0 -to $t1 -ar 24000 -ac 1 refs/speaker.wav && ffmpeg -i refs/speaker.wav -af volumedetect -f null - 2>&1 | grep -E 'mean_volume|max_volume'"
+    ;;
   curve)
-    # Render the excitement plan in your own voice, one sentence at a time.
+    # Render the excitement plan in your own voice.
     conf; prosody_env
     local set="${1:-curve}"; shift || true
     local plan; plan=$(mktemp -t slidemaker-plan)
     "$PROSODY" json "$@" > "$plan" || die "could not build the plan"
     local nseg; nseg=$(python3 -c "import json,sys; p=json.load(open('$plan')); print(sum(len(s['segments']) for s in p['slides']))")
-    echo "plan: $nseg sentences -> $CLONE_HOST"
+    echo "plan: $nseg sentences -> $CLONE_HOST ($CLONE_ENGINE)"
     scp -q "$plan" "$CLONE_HOST:$CLONE_DIR/plan.json"
-    scp -q "$(dirname "$PROSODY")/slidemaker-clone-curve.py" "$CLONE_HOST:$CLONE_DIR/"
     rm -f "$plan"
-    local stop="" start=""
+    local stop="" start="" run=""
     if [ -n "$CLONE_STOP_SERVICE" ]; then
       stop="sudo systemctl stop $CLONE_STOP_SERVICE;"
       start="sudo systemctl start $CLONE_STOP_SERVICE;"
     fi
-    clone_ssh "cd $CLONE_DIR && $stop $CLONE_VENV/bin/python slidemaker-clone-curve.py plan.json $set; rc=\$?; $start exit \$rc"
+    case "$CLONE_ENGINE" in
+      f5)
+        scp -q "$(dirname "$PROSODY")/slidemaker-clone-curve.py" "$CLONE_HOST:$CLONE_DIR/"
+        run="$CLONE_VENV/bin/python slidemaker-clone-curve.py plan.json $set"
+        ;;
+      indextts)
+        scp -q "$(dirname "$PROSODY")/slidemaker-clone-indextts.py" "$CLONE_HOST:$CLONE_DIR/"
+        # Run from the checkout so the package and checkpoints resolve.
+        run="cd \$HOME/$INDEXTTS_DIR && INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF"
+        ;;
+      *) die "CLONE_ENGINE must be f5 or indextts (got $CLONE_ENGINE)" ;;
+    esac
+    clone_ssh "cd $CLONE_DIR && $stop ($run); rc=\$?; $start exit \$rc"
     mkdir -p "voice-$set"
     scp -q "$CLONE_HOST:$CLONE_DIR/$set/slide*.wav" "voice-$set/"
     echo "fetched into voice-$set/ — build with: slidemaker video voice-$set"
