@@ -25,6 +25,7 @@ Commands: plan | synth | curve-init | report
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import re
@@ -59,11 +60,19 @@ class Config:
         self.edge_bin = os.environ.get('SM_EDGE_TTS_BIN', 'edge-tts')
         self.curve_file = os.environ.get('SM_CURVE_FILE', 'curve.tsv')
         self.curve_default = os.environ.get('SM_CURVE_DEFAULT', 'auto')
-        # Prosody at e=0 : e=1. Ranges are deliberately wide enough to hear
-        # and narrow enough that the voice stays the same person throughout.
-        self.rate = _pair('SM_E_RATE', '-3:16')      # percent
-        self.pitch = _pair('SM_E_PITCH', '-4:14')    # Hz
-        self.volume = _pair('SM_E_VOLUME', '0:8')    # percent
+        # Prosody at e=0 : e=1.
+        #
+        # Excitement is NOT "faster and higher". Pushing rate and pitch up
+        # together is what makes synthetic narration speed up and go nasal.
+        # Real speakers get louder, pause before the important line, and
+        # slow down on the payoff so it lands. So: volume is the main lever
+        # and is monotonic; rate and pitch follow EASE below, which peaks at
+        # three-quarter energy and eases back at the top; pitch travel is
+        # kept small because shifting a neural voice's pitch is exactly the
+        # artefact that reads as nasal.
+        self.rate = _pair('SM_E_RATE', '-2:9')       # percent
+        self.pitch = _pair('SM_E_PITCH', '-1:3')     # Hz
+        self.volume = _pair('SM_E_VOLUME', '0:12')   # percent
         self.gap = _pair('SM_E_GAP', '0.34:0.15')    # seconds between sentences
         self.jitter = (os.environ.get('SM_E_JITTER', 'on').lower()
                        not in ('off', '0', 'false', 'no'))
@@ -178,6 +187,20 @@ def clamp(e):
     return max(0.0, min(1.0, e))
 
 
+# How rate and pitch track energy. Not a straight line: speech quickens as a
+# speaker warms up, then *slows* on the peak line so it lands. Mapping energy
+# straight through to rate is what produces the breathless, nasal read.
+EASE = [(0.00, 0.00), (0.50, 0.75), (0.75, 1.00), (1.00, 0.45)]
+
+
+def ease(e):
+    for (x0, y0), (x1, y1) in zip(EASE, EASE[1:]):
+        if e <= x1:
+            t = 0.0 if x1 == x0 else (e - x0) / (x1 - x0)
+            return y0 + (y1 - y0) * t
+    return EASE[-1][1]
+
+
 # ------------------------------------------------------------ plan building
 
 def build_segments(text, base):
@@ -281,10 +304,13 @@ def plan_slide(cfg, index, curve):
 
     for i, s in enumerate(segs):
         e = s['energy']
-        jr, jp = _jitter(s['text'], 1.5) if cfg.jitter else (0.0, 0.0)
-        s['rate'] = round(r0 + (r1 - r0) * e + jr)
-        s['pitch'] = round(p0 + (p1 - p0) * e + jp * 0.8)
-        s['volume'] = round(v0 + (v1 - v0) * e)
+        jr, jp = _jitter(s['text'], 1.2) if cfg.jitter else (0.0, 0.0)
+        k = ease(e)
+        s['rate'] = round(r0 + (r1 - r0) * k + jr)
+        s['pitch'] = round(p0 + (p1 - p0) * k + jp * 0.4)
+        s['volume'] = round(v0 + (v1 - v0) * e)   # loudness is the real lever
+        # F5-TTS speed multiplier for the voice-clone renderer.
+        s['speed'] = round(0.94 + 0.14 * k, 3)
 
         nxt = segs[i + 1]['energy'] if i + 1 < len(segs) else None
         gap = g0 + (g1 - g0) * e
@@ -305,7 +331,21 @@ def plan_slide(cfg, index, curve):
             why.append('beat')
         s['gap'] = 0.0 if nxt is None else round(max(gap, 0.08), 2)
         s['why'] = ','.join(why) or '-'
+        s['band'] = band_for(e)
     return segs
+
+
+# Voice-clone renderer: excitement cannot be dialled in with DSP, it has to be
+# present in the reference recording. Each band points at a span of your own
+# voice at that energy, and every sentence is cloned from the band it needs.
+BANDS = [(0.45, 'calm'), (0.75, 'mid')]
+
+
+def band_for(e):
+    for thresh, name in BANDS:
+        if e < thresh:
+            return name
+    return 'hot'
 
 
 # ------------------------------------------------------------------ synth
@@ -386,6 +426,20 @@ def cmd_plan(cfg, args):
                   f"{s['rate']:+3d}% {s['pitch']:+3d}Hz {s['volume']:+2d}% "
                   f"gap {s['gap']:.2f} {s['why']:<10} {preview}")
     print(f"\n{total_words} words, {total_gap:.1f}s of planned silence")
+
+
+def cmd_json(cfg, args):
+    """Emit the whole deck plan for the voice-clone renderer on the GPU host."""
+    curve = load_curve(cfg)
+    deck = []
+    for i in slide_range(cfg, args):
+        segs = plan_slide(cfg, i, curve)
+        deck.append({'slide': f"{i:02d}",
+                     'segments': [{'text': s['text'], 'energy': round(s['energy'], 3),
+                                   'speed': s['speed'], 'gap': s['gap'],
+                                   'band': s['band']} for s in segs]})
+    json.dump({'slides': deck}, sys.stdout, indent=1)
+    sys.stdout.write('\n')
 
 
 def cmd_synth(cfg, args):
@@ -490,7 +544,7 @@ def main():
     ap = argparse.ArgumentParser(prog='slidemaker-prosody', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('plan', 'synth', 'report', 'curve-init'):
+    for name in ('plan', 'json', 'synth', 'report', 'curve-init'):
         p = sub.add_parser(name)
         p.add_argument('--slide', type=int)
         p.add_argument('--force', action='store_true')
@@ -498,8 +552,8 @@ def main():
             p.add_argument('dir', nargs='?')
     args = ap.parse_args()
     CFG = Config()
-    {'plan': cmd_plan, 'synth': cmd_synth, 'report': cmd_report,
-     'curve-init': cmd_curve_init}[args.cmd](CFG, args)
+    {'plan': cmd_plan, 'json': cmd_json, 'synth': cmd_synth,
+     'report': cmd_report, 'curve-init': cmd_curve_init}[args.cmd](CFG, args)
 
 
 CFG = Config()

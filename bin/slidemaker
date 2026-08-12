@@ -13,7 +13,10 @@
 #   prosody [DIR]         measure built audio — rate and loudness variation
 #   clone setup           install F5-TTS (+deps) on CLONE_HOST
 #   clone ship FILE       upload a voice sample to CLONE_HOST
-#   clone spans           list candidate reference spans (Whisper, GPU)
+#   clone spans [SRC]     list candidate reference spans (Whisper, GPU)
+#   clone band B SRC N    register span N as energy band B (calm|mid|hot)
+#   clone bands           show the registered energy bands
+#   clone curve [SET]     render the excitement curve in your cloned voice
 #   clone test N [SLIDE]  synthesize one slide with span N and play it
 #   clone all N [SET]     synthesize every slide with span N into remote SET
 #   clone fetch [SET]     download a remote SET into voice-SET/
@@ -51,12 +54,14 @@ conf() {
   EXCITEMENT="${EXCITEMENT:-curve}"      # curve | off
   CURVE_FILE="${CURVE_FILE:-curve.tsv}"  # inside NARRATION_DIR
   CURVE_DEFAULT="${CURVE_DEFAULT:-auto}" # auto | 0.0-1.0
-  E_RATE="${E_RATE:--3:16}"              # percent   at energy 0 : 1
-  E_PITCH="${E_PITCH:--4:14}"            # Hz        at energy 0 : 1
-  E_VOLUME="${E_VOLUME:-0:8}"            # percent   at energy 0 : 1
+  # Loudness is the excitement lever. Rate moves a little and eases back at
+  # the peak; pitch barely moves at all — pushing rate and pitch up together
+  # is what makes synthetic narration speed up and turn nasal.
+  E_RATE="${E_RATE:--2:9}"               # percent   at energy 0 : 1
+  E_PITCH="${E_PITCH:--1:3}"             # Hz        at energy 0 : 1
+  E_VOLUME="${E_VOLUME:-0:12}"           # percent   at energy 0 : 1
   E_GAP="${E_GAP:-0.34:0.15}"            # seconds between sentences, 0 : 1
   E_JITTER="${E_JITTER:-on}"
-  CLONE_SPANS="${CLONE_SPANS:-}"         # calm,mid,hot reference spans
 }
 
 # Export config for the Python prosody engine.
@@ -85,23 +90,24 @@ TTS_VOICE=en-US-AndrewMultilingualNeural
 #EDGE_TTS_BIN=/path/to/edge-tts
 
 # Excitement curve — the difference between narration and a robot reading.
-# Energy 0.0-1.0 per sentence drives rate, pitch, volume and pause length.
-# Sources, highest first: [e=..] markers in the narration text, then
+# Energy 0.0-1.0 per sentence drives loudness, pause length, and (gently)
+# rate. Sources, highest first: [e=..] markers in the narration text, then
 # NARRATION_DIR/curve.tsv, then CURVE_DEFAULT.
 EXCITEMENT=curve        # curve | off (off = one flat pass per slide)
 CURVE_DEFAULT=auto      # auto talk arc, or a fixed 0.0-1.0
 #CURVE_FILE=curve.tsv
-#E_RATE=-3:16           # speech rate percent at energy 0 : 1
-#E_PITCH=-4:14          # pitch Hz at energy 0 : 1
-#E_VOLUME=0:8           # volume percent at energy 0 : 1
+#E_VOLUME=0:12          # volume percent at energy 0 : 1 — the main lever
+#E_RATE=-2:9            # speech rate percent at energy 0 : 1
+#E_PITCH=-1:3           # pitch Hz at energy 0 : 1 — keep small, see README
 #E_GAP=0.34:0.15        # pause seconds between sentences at energy 0 : 1
 #E_JITTER=on            # per-sentence micro-variation (deterministic)
 
-# Voice cloning (optional): a Linux GPU host reachable over ssh
+# Voice cloning (optional): a Linux GPU host reachable over ssh.
+# Your own voice at three energy levels beats any prosody tuning — see
+# "Excitement in your own voice" in the README.
 #CLONE_HOST=user@gpubox
 #CLONE_VENV=~/.f5venv
 #CLONE_STOP_SERVICE=llmpager   # systemd unit to stop during GPU synthesis
-#CLONE_SPANS=3,7,11            # calm,mid,hot reference spans by energy band
 EOF
   echo "wrote slidemaker.conf — edit it, then: slidemaker render && slidemaker tts && slidemaker video"
 }
@@ -156,17 +162,27 @@ cmd_tts() {
     local n; n=$(nn "$i")
     local txt="$NARRATION_DIR/slide$n.txt"
     [ -f "$txt" ] || die "missing $txt"
+    # Curve markers are direction for the engine, not words to be spoken —
+    # strip them before any backend that reads the file verbatim.
+    local plain; plain=$(mktemp -t slidemaker)
+    strip_markers "$txt" > "$plain"
     if [ "$TTS_ENGINE" = edge ]; then
-      [ -f "tts/slide$n.mp3" ] && continue
+      [ -f "tts/slide$n.mp3" ] && { rm -f "$plain"; continue; }
       "$EDGE_TTS_BIN" --voice "$TTS_VOICE" --rate=+3% \
-        --file "$txt" --write-media "tts/slide$n.mp3" >/dev/null 2>&1
+        --file "$plain" --write-media "tts/slide$n.mp3" >/dev/null 2>&1
       echo "tts/slide$n.mp3"
     else
-      [ -f "tts/slide$n.aiff" ] && continue
-      say -v "$TTS_VOICE" -o "tts/slide$n.aiff" -f "$txt"
+      [ -f "tts/slide$n.aiff" ] && { rm -f "$plain"; continue; }
+      say -v "$TTS_VOICE" -o "tts/slide$n.aiff" -f "$plain"
       echo "tts/slide$n.aiff"
     fi
+    rm -f "$plain"
   done
+}
+
+# Remove [e=..] / [e=A>B] / [beat..] markers, leaving clean narration text.
+strip_markers() {
+  sed -E 's/\[[[:space:]]*(e[[:space:]]*=[[:space:]]*[0-9.]+([[:space:]]*>[[:space:]]*[0-9.]+)?|beat([[:space:]]*=[[:space:]]*[0-9.]+)?)[[:space:]]*\]//gI' "$1"
 }
 
 clone_ssh() { conf; [ -n "$CLONE_HOST" ] || die "CLONE_HOST not set"; ssh -o BatchMode=yes "$CLONE_HOST" "$@"; }
@@ -184,11 +200,13 @@ cmd_clone() {
     scp -q -r "$NARRATION_DIR" "$CLONE_HOST:$CLONE_DIR/narration"
     ;;
   spans)
-    clone_ssh "cd $CLONE_DIR && $CLONE_VENV/bin/python - <<'PYEOF'
+    conf; local src="${1:-memo}"
+    clone_ssh "cd $CLONE_DIR && SRC=$src $CLONE_VENV/bin/python - <<'PYEOF'
 from transformers import pipeline
-import json, subprocess
+import json, os, subprocess
+src = os.environ['SRC']
 asr = pipeline('automatic-speech-recognition', model='openai/whisper-base.en', return_timestamps=True, device='cuda')
-chunks = asr('memo.wav')['chunks']
+chunks = asr(src + '.wav')['chunks']
 cands = []
 for i in range(len(chunks)):
     t0 = chunks[i]['timestamp'][0]
@@ -203,10 +221,54 @@ for i in range(len(chunks)):
         if 9.5 <= t1 - t0 <= 12.0:
             cands.append((t0, t1, text.strip()))
             break
-json.dump(cands, open('spans.json', 'w'))
+json.dump(cands, open('spans-' + src + '.json', 'w'))
 for k, (t0, t1, text) in enumerate(cands, 1):
     print(k, round(t0, 1), round(t1, 1), '|', text[:70])
 PYEOF"
+    ;;
+  band)
+    # Register one energy band of your own voice as a clone reference.
+    conf
+    local name="${1:?usage: slidemaker clone band <calm|mid|hot> SOURCE N}"
+    local src="${2:?usage: slidemaker clone band <calm|mid|hot> SOURCE N}"
+    local k="${3:?usage: slidemaker clone band <calm|mid|hot> SOURCE N}"
+    case "$name" in calm|mid|hot) ;; *) die "band must be calm, mid or hot" ;; esac
+    clone_ssh "cd $CLONE_DIR && mkdir -p refs && $CLONE_VENV/bin/python -c \"
+import json
+c = json.load(open('spans-$src.json'))[$k-1]
+import subprocess
+subprocess.run(['ffmpeg','-v','error','-y','-i','$src.wav','-ss',str(c[0]),'-to',str(c[1]),'refs/$name.wav'], check=True)
+open('refs/$name.txt','w').write(c[2])
+print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
+    ;;
+  bands)
+    clone_ssh "cd $CLONE_DIR && for b in calm mid hot; do
+      if [ -f refs/\$b.wav ]; then
+        printf '%-5s %5.1fs  ' \$b \$(ffprobe -v error -show_entries format=duration -of csv=p=0 refs/\$b.wav)
+        head -c 60 refs/\$b.txt; echo
+      else echo \"\$b   (not set)\"; fi
+    done"
+    ;;
+  curve)
+    # Render the excitement plan in your own voice, one sentence at a time.
+    conf; prosody_env
+    local set="${1:-curve}"; shift || true
+    local plan; plan=$(mktemp -t slidemaker-plan)
+    "$PROSODY" json "$@" > "$plan" || die "could not build the plan"
+    local nseg; nseg=$(python3 -c "import json,sys; p=json.load(open('$plan')); print(sum(len(s['segments']) for s in p['slides']))")
+    echo "plan: $nseg sentences -> $CLONE_HOST"
+    scp -q "$plan" "$CLONE_HOST:$CLONE_DIR/plan.json"
+    scp -q "$(dirname "$PROSODY")/slidemaker-clone-curve.py" "$CLONE_HOST:$CLONE_DIR/"
+    rm -f "$plan"
+    local stop="" start=""
+    if [ -n "$CLONE_STOP_SERVICE" ]; then
+      stop="sudo systemctl stop $CLONE_STOP_SERVICE;"
+      start="sudo systemctl start $CLONE_STOP_SERVICE;"
+    fi
+    clone_ssh "cd $CLONE_DIR && $stop $CLONE_VENV/bin/python slidemaker-clone-curve.py plan.json $set; rc=\$?; $start exit \$rc"
+    mkdir -p "voice-$set"
+    scp -q "$CLONE_HOST:$CLONE_DIR/$set/slide*.wav" "voice-$set/"
+    echo "fetched into voice-$set/ — build with: slidemaker video voice-$set"
     ;;
   test)
     conf; local k="${1:?usage: slidemaker clone test SPAN [SLIDE]}"; local slide="${2:-$SLIDES}"
