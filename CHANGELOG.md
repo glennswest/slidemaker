@@ -16,6 +16,10 @@
 - **feat:** Slew-rate limiter on every acoustic parameter, so a curve
   can request anything but the renderer never emits a discontinuity that
   sounds like the speaker was swapped
+- **feat:** `CLONE_ENGINE=indextts` — IndexTTS-2 backend where the curve
+  drives an emotion vector with the speaker prompt held fixed, the first
+  configuration where energy changes without identity changing. `EMO_GAIN`
+  scales the axis; `clone ref` cuts a speaker prompt (no transcript needed)
 - **feat:** Energy-band voice cloning — `clone spans SRC`, `clone band`,
   `clone bands`, `clone curve`; the GPU-side renderer loads F5 once for
   the whole deck instead of once per sentence

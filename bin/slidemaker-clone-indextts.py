@@ -35,19 +35,27 @@ import soundfile as sf
 EMO_DIMS = 8
 
 
-def emotion_vector(e):
+def emotion_vector(e, gain=None):
     """Map one energy value onto the excitement axis of the emotion space.
 
-    Excitement is mostly 'happy' with a little 'surprised' on top; the low
-    end is not sadness, it is calm. Everything else stays at zero — this is
-    a narration engine, not an acting engine, and reaching for the other
-    dimensions is how you get a delivery that sounds unhinged.
+    Excitement is mostly 'happy' with a touch of 'surprised' at the very
+    top; the low end is not sadness, it is calm. Everything else stays at
+    zero — this is a narration engine, not an acting engine, and reaching
+    for the other dimensions is how you get a delivery that sounds unhinged.
+
+    The usable range is far narrower than it looks. A vector of happy=0.72
+    with surprised=0.24 is not "an excited presenter", it is too much, and
+    it drags loudness and speed along with it. Full energy here asks for
+    roughly happy=0.30 — a lift, not a performance. EMO_GAIN scales the
+    whole axis so this is a dial you can turn rather than a constant I have
+    guessed at.
     """
+    g = float(os.environ.get('SM_EMO_GAIN', '1.0')) if gain is None else gain
     v = [0.0] * EMO_DIMS
-    v[0] = min(1.0, max(0.0, (e - 0.35) * 1.10))   # happy
-    v[6] = min(1.0, max(0.0, (e - 0.70) * 0.80))   # surprised
-    v[7] = min(1.0, max(0.0, (0.50 - e) * 1.40))   # calm
-    return [round(x, 3) for x in v]
+    v[0] = (e - 0.35) * 0.45 * g          # happy
+    v[6] = (e - 0.85) * 0.30 * g          # surprised, only right at the top
+    v[7] = (0.50 - e) * 1.00 * g          # calm
+    return [round(min(1.0, max(0.0, x)), 3) for x in v]
 
 
 def call(fn, **kwargs):
@@ -81,9 +89,7 @@ def main():
     from indextts.infer_v2 import IndexTTS2
     here = os.path.dirname(os.path.abspath(__file__))
     ckpt = os.environ.get('INDEXTTS_CKPT', os.path.join(here, 'checkpoints'))
-    tts = call(IndexTTS2.__init__.__wrapped__ if hasattr(IndexTTS2.__init__, '__wrapped__')
-               else IndexTTS2,
-               cfg_path=os.path.join(ckpt, 'config.yaml'),
+    tts = call(IndexTTS2, cfg_path=os.path.join(ckpt, 'config.yaml'),
                model_dir=ckpt, use_fp16=True, use_cuda_kernel=False)
 
     tmp = os.path.join(outdir, '.piece.wav')

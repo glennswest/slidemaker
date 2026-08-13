@@ -72,14 +72,33 @@ by processing has been worse than the flat read:
   that shipped (-25.7 dB mean / -7.9 peak vs -28.1 / -11.9) and sounded
   worse. Defaults are back to known-good; SM_CLONE_INTENSITY opts in.
 
-Where that leaves it: inside one continuous pass there is no per-sentence
-lever at all. The curve chooses reference, speed and loudness per slide.
-Real per-sentence performance needs either a TTS with genuine style
-control, or the presenter actually performing the take. **Untested
-hypothesis:** a properly recorded energetic reference (same mic, same
-room, same session as the calm one) may be enough — energy.wav has not
-been verified as a good recording, and every clone from it has sounded
-poor.
+### Resolved: the engine was the problem, not the tuning
+
+F5 cannot express an excitement curve at all. Timbre and emotion arrive
+through the same input — the reference clip — so "same voice, more
+excited" is not expressible, and every attempt to get energy out of it
+was really a request to change speaker. That is why the tone moved.
+
+IndexTTS-2 separates them: speaker prompt for identity, an eight-value
+emotion vector for delivery. Verified on ai.g8.lo (Blackwell sm_120,
+torch cu13, RTF ~0.79, 5.5G checkpoints). Same speaker prompt at two
+energies held identity, and the user's verdict was "no weirdness" — the
+nasal, tone-swap and uncanny-splice problems all disappeared.
+
+What remains is calibration, and the usable range is far narrower than it
+looks:
+- happy=0.72 / surprised=0.24 is "head exploded", not an excited
+  presenter, and it drags loudness (+7.3 dB) and speed (-14% duration)
+  along with it
+- full curve energy now asks for about happy=0.30, surprised=0.05, which
+  holds level flat at -27.0 dB across the whole energy range
+- EMO_GAIN scales the axis so this stays a dial rather than a constant
+  someone guessed at
+
+Speaker prompt: 11s cut from memo.wav (the car recording) at -28.4 dB
+mean / -13.7 peak, matching the take that shipped. energy.wav is no
+longer needed for the excitement path — emotion no longer comes from the
+reference at all.
 
 ## Session Log
 
