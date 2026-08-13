@@ -241,6 +241,7 @@ def build_segments(text, base):
     items = _merge_fragments(items)
     if not items:
         return items
+    marked = {i for i, it in enumerate(items) if spans.get(it['span']) is not None}
 
     # Energy per segment: explicit spans interpolate across their own
     # sentences; unmarked text follows the slide base with a gentle rise, so
@@ -259,7 +260,56 @@ def build_segments(text, base):
                 a, b = spec
                 t = 0.0 if len(idxs) == 1 else k / (len(idxs) - 1)
                 items[i]['energy'] = clamp(a + (b - a) * t)
+    structural(items, marked)
     return items
+
+
+def structural(items, marked):
+    """Read the energy out of the writing, for sentences you didn't mark.
+
+    A script already encodes its own arc, and the strongest signal is
+    sentence length. "Two days ago I showed you L.L.M. Pager running a
+    thirty billion parameter model on a sixteen gigabyte graphics card"
+    is setup; "A lot bigger." is the punch. A short sentence immediately
+    after a long one IS the emphasis — that is what the writer meant by
+    putting it there, so it does not also need marking up by hand.
+
+    Signals, all relative to the slide rather than absolute:
+      - position: energy rises toward the last line of the slide
+      - brevity: shorter than the slide's average lifts, longer settles
+      - contrast: a sentence much shorter than the one before it lifts more
+      - punctuation: '!' lifts, '?' lifts slightly
+
+    Explicitly marked sentences are left exactly as written — the markers
+    are the author overriding this, and they win.
+    """
+    n = len(items)
+    if n == 0:
+        return
+    counts = [len(it['text'].split()) for it in items]
+    mean_words = sum(counts) / n
+    rise = float(os.environ.get('SM_E_STRUCT_RISE', '0.22'))
+    weight = float(os.environ.get('SM_E_STRUCT', '1.0'))
+    if weight <= 0:
+        return
+    for i, it in enumerate(items):
+        if i in marked:
+            continue
+        delta = 0.0
+        # Build toward the end of the slide.
+        delta += rise * ((i / (n - 1)) - 0.5) * 2 if n > 1 else 0.0
+        # Brevity, as a ratio to this slide's own average.
+        rel = counts[i] / mean_words if mean_words else 1.0
+        delta += max(-0.20, min(0.30, (1.0 - rel) * 0.35))
+        # A short line after a long one is the emphasis.
+        if i and counts[i - 1] >= 1.6 * counts[i]:
+            delta += 0.12
+        tail = it['text'].rstrip()[-1:]
+        if tail == '!':
+            delta += 0.15
+        elif tail == '?':
+            delta += 0.05
+        it['energy'] = clamp(it['energy'] + delta * weight)
 
 
 def _merge_fragments(items):

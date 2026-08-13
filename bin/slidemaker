@@ -63,6 +63,7 @@ conf() {
   CLONE_ENGINE="${CLONE_ENGINE:-f5}"     # f5 | indextts
   INDEXTTS_DIR="${INDEXTTS_DIR:-index-tts}"   # checkout on CLONE_HOST
   CLONE_REF="${CLONE_REF:-refs/speaker.wav}"  # speaker prompt (indextts)
+  CLONE_MODE="${CLONE_MODE:-slide}"      # slide | arc | sentence (indextts)
   # Scales the whole emotion axis. The usable range is narrow: 1.0 puts full
   # curve energy at about happy=0.30, which is a lift, not a performance.
   EMO_GAIN="${EMO_GAIN:-1.0}"
@@ -299,7 +300,7 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
       indextts)
         scp -q "$(dirname "$PROSODY")/slidemaker-clone-indextts.py" "$CLONE_HOST:$CLONE_DIR/"
         # Run from the checkout so the package and checkpoints resolve.
-        run="cd \$HOME/$INDEXTTS_DIR && SM_EMO_GAIN=$EMO_GAIN INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF"
+        run="cd \$HOME/$INDEXTTS_DIR && SM_EMO_GAIN=$EMO_GAIN INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF --mode $CLONE_MODE"
         ;;
       *) die "CLONE_ENGINE must be f5 or indextts (got $CLONE_ENGINE)" ;;
     esac

@@ -20,7 +20,7 @@ model is: the intonation contour restarts at every join. The difference
 here is that per-slide energy no longer costs you your identity.
 
 Usage: slidemaker-clone-indextts.py PLAN.json OUTDIR [--slide NN]
-                                    [--mode slide|sentence] [--ref WAV]
+                                    [--mode slide|arc|sentence] [--ref WAV]
 """
 
 import inspect
@@ -76,8 +76,8 @@ def main():
     mode = opt('--mode', 'slide')
     ref = opt('--ref', os.path.join(os.path.dirname(plan_path) or '.',
                                     'refs', 'calm.wav'))
-    if mode not in ('slide', 'sentence'):
-        sys.exit('--mode must be slide or sentence')
+    if mode not in ('slide', 'arc', 'sentence'):
+        sys.exit('--mode must be slide, arc or sentence')
     if not os.path.exists(ref):
         sys.exit(f"speaker prompt not found: {ref}")
 
@@ -99,7 +99,52 @@ def main():
         segs = slide['segments']
         out = os.path.join(outdir, f"slide{slide['slide']}.wav")
 
-        if mode == 'slide':
+        if mode == 'arc':
+            # One vector for a whole slide throws the build away; one per
+            # sentence is splicing. So: group consecutive sentences whose
+            # energy quantises the same, render each run as one continuous
+            # pass, and join only where the energy actually steps — which is
+            # where a speaker would draw breath anyway. A slide usually comes
+            # out as two or three runs, not eight fragments.
+            # Quantising energy into bands fragments a slide into six or
+            # seven pieces, which is splicing wearing a hat. Instead: cut at
+            # most SM_EMO_RUNS-1 times, at the biggest energy steps in the
+            # slide, keeping every run at least two sentences long. Each run
+            # then speaks at its own mean energy.
+            max_runs = int(os.environ.get('SM_EMO_RUNS', '3'))
+            jumps = sorted(
+                (abs(segs[i + 1]['energy'] - segs[i]['energy']), i + 1)
+                for i in range(len(segs) - 1))
+            cuts = []
+            for _, idx in reversed(jumps):
+                if len(cuts) >= max_runs - 1:
+                    break
+                edges = sorted(cuts + [idx, 0, len(segs)])
+                if min(b - a for a, b in zip(edges, edges[1:])) >= 2:
+                    cuts.append(idx)
+            runs = []
+            for a, b in zip([0] + sorted(cuts), sorted(cuts) + [len(segs)]):
+                part = segs[a:b]
+                runs.append({'q': sum(s['energy'] for s in part) / len(part),
+                             'segs': part})
+            pieces, sr = [], None
+            for r in runs:
+                emo = emotion_vector(r['q'])
+                call(tts.infer, spk_audio_prompt=ref,
+                     text=' '.join(x['text'] for x in r['segs']),
+                     output_path=tmp, emo_vector=emo, emo_alpha=1.0,
+                     verbose=False)
+                w, sr = sf.read(tmp, dtype='float32')
+                pieces.append(w if w.ndim == 1 else w.mean(axis=1))
+                gap = r['segs'][-1]['gap']
+                if gap > 0 and r is not runs[-1]:
+                    pieces.append(np.zeros(int(gap * sr), dtype=np.float32))
+                print(f"  {slide['slide']} run e={r['q']:.2f} emo={emo} "
+                      f"{len(r['segs'])} sentences", flush=True)
+            sf.write(out, np.concatenate(pieces), sr)
+            print(f"  {slide['slide']} {len(runs)} runs, {len(segs)} sentences",
+                  flush=True)
+        elif mode == 'slide':
             e = sum(s['energy'] for s in segs) / len(segs)
             emo = emotion_vector(e)
             call(tts.infer, spk_audio_prompt=ref,
