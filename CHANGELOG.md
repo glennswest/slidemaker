@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.3.0] — 2026-08-14
+
 ### 2026-08-12
 - **BREAKING:** Renamed `gmedia` to `slidemaker` and moved to its own
   repo. `slidemaker.conf` is the config name; `gmedia.conf` is still

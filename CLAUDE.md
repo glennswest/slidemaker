@@ -9,7 +9,7 @@ work, where every piece was proven end to end.
 
 ## Version
 
-Current: **0.2.0** (pre-1.0)
+Current: **0.3.0** (pre-1.0)
 
 Version locations:
 - `bin/slidemaker` — `SLIDEMAKER_VERSION`
