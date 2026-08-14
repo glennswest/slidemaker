@@ -8,7 +8,8 @@
 #   pdf                   export the deck to <deck>.pdf
 #   record [SECS]         record mic to sample.m4a (default 90s) + level check
 #   check FILE            report duration and volume levels of an audio file
-#   curve [init]          show the excitement curve; init seeds curve.tsv
+#   curve [init|read]     show the curve; init seeds curve.tsv;
+#                         read has a local LLM derive the emotional flow
 #   tts [--force]         synthesize all slides with TTS_ENGINE into tts/
 #   prosody [DIR]         measure built audio — rate and loudness variation
 #   clone setup           install F5-TTS (+deps) on CLONE_HOST
@@ -66,11 +67,19 @@ conf() {
   CLONE_MODE="${CLONE_MODE:-slide}"      # slide | arc | sentence (indextts)
   # Scales the whole emotion axis. The usable range is narrow: 1.0 puts full
   # curve energy at about happy=0.30, which is a lift, not a performance.
-  EMO_GAIN="${EMO_GAIN:-1.0}"
+  EMO_GAIN="${EMO_GAIN:-1.6}"
+  # Tempo at energy 0 : 1. The front of a slide is the quiet part and should
+  # not outrun the payoff; widen this if an opening still sounds rushed.
+  SM_TEMPO="${SM_TEMPO:-0.86:1.06}"
+  EMO_RUNS="${EMO_RUNS:-3}"              # max continuous runs per slide (arc)
   # Excitement curve (see slidemaker-prosody). off = the old flat one-shot TTS.
   EXCITEMENT="${EXCITEMENT:-curve}"      # curve | off
   CURVE_FILE="${CURVE_FILE:-curve.tsv}"  # inside NARRATION_DIR
   CURVE_DEFAULT="${CURVE_DEFAULT:-auto}" # auto | 0.0-1.0
+  # `slidemaker curve read` has a local model read the narration and write
+  # the emotional flow to NARRATION_DIR/curve.json.
+  LLM_URL="${LLM_URL:-http://ai.g8.lo:8090/v1/chat/completions}"
+  LLM_MODEL="${LLM_MODEL:-qwen3-30b-a3b}"
   # Loudness is the excitement lever. Rate moves a little and eases back at
   # the peak; pitch barely moves at all — pushing rate and pitch up together
   # is what makes synthetic narration speed up and turn nasal.
@@ -87,7 +96,8 @@ prosody_env() {
          SM_TTS_VOICE="$TTS_VOICE" SM_EDGE_TTS_BIN="$EDGE_TTS_BIN" \
          SM_CURVE_FILE="$CURVE_FILE" SM_CURVE_DEFAULT="$CURVE_DEFAULT" \
          SM_E_RATE="$E_RATE" SM_E_PITCH="$E_PITCH" SM_E_VOLUME="$E_VOLUME" \
-         SM_E_GAP="$E_GAP" SM_E_JITTER="$E_JITTER"
+         SM_E_GAP="$E_GAP" SM_E_JITTER="$E_JITTER" \
+         SM_LLM_URL="$LLM_URL" SM_LLM_MODEL="$LLM_MODEL"
 }
 
 nn() { printf "%02d" "$1"; }
@@ -165,7 +175,11 @@ cmd_check() {
 
 cmd_curve() {
   conf; prosody_env
-  if [ "${1:-}" = init ]; then shift; "$PROSODY" curve-init "$@"; else "$PROSODY" plan "$@"; fi
+  case "${1:-}" in
+    init) shift; "$PROSODY" curve-init "$@" ;;
+    read) shift; "$PROSODY" annotate "$@" ;;   # local model reads the script
+    *)    "$PROSODY" plan "$@" ;;
+  esac
 }
 
 cmd_prosody() { conf; prosody_env; "$PROSODY" report "$@"; }
@@ -199,7 +213,7 @@ cmd_tts() {
 
 # Remove [e=..] / [e=A>B] / [beat..] markers, leaving clean narration text.
 strip_markers() {
-  sed -E 's/\[[[:space:]]*(e[[:space:]]*=[[:space:]]*[0-9.]+([[:space:]]*>[[:space:]]*[0-9.]+)?|beat([[:space:]]*=[[:space:]]*[0-9.]+)?)[[:space:]]*\]//gI' "$1"
+  sed -E 's/\[[[:space:]]*(e[[:space:]]*=[[:space:]]*[0-9.]+([[:space:]]*>[[:space:]]*[0-9.]+)?|v[[:space:]]*=[[:space:]]*[+-]?[0-9.]+|problem|grave|serious|bright|beat([[:space:]]*=[[:space:]]*[0-9.]+)?)[[:space:]]*\]//gI' "$1"
 }
 
 clone_ssh() { conf; [ -n "$CLONE_HOST" ] || die "CLONE_HOST not set"; ssh -o BatchMode=yes "$CLONE_HOST" "$@"; }
@@ -300,7 +314,7 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
       indextts)
         scp -q "$(dirname "$PROSODY")/slidemaker-clone-indextts.py" "$CLONE_HOST:$CLONE_DIR/"
         # Run from the checkout so the package and checkpoints resolve.
-        run="cd \$HOME/$INDEXTTS_DIR && SM_EMO_GAIN=$EMO_GAIN INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF --mode $CLONE_MODE"
+        run="cd \$HOME/$INDEXTTS_DIR && SM_E_VALENCE=${E_VALENCE:-auto} SM_EMO_RUNS=$EMO_RUNS SM_TEMPO=$SM_TEMPO SM_EMO_GAIN=$EMO_GAIN INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF --mode $CLONE_MODE"
         ;;
       *) die "CLONE_ENGINE must be f5 or indextts (got $CLONE_ENGINE)" ;;
     esac

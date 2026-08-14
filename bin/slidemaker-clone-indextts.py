@@ -26,6 +26,7 @@ Usage: slidemaker-clone-indextts.py PLAN.json OUTDIR [--slide NN]
 import inspect
 import json
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -35,7 +36,7 @@ import soundfile as sf
 EMO_DIMS = 8
 
 
-def emotion_vector(e, gain=None):
+def emotion_vector(e, valence=1.0, gain=None):
     """Map one energy value onto the excitement axis of the emotion space.
 
     Excitement is mostly 'happy' with a touch of 'surprised' at the very
@@ -51,10 +52,16 @@ def emotion_vector(e, gain=None):
     guessed at.
     """
     g = float(os.environ.get('SM_EMO_GAIN', '1.0')) if gain is None else gain
+    up, down = max(0.0, valence), max(0.0, -valence)
     v = [0.0] * EMO_DIMS
-    v[0] = (e - 0.35) * 0.45 * g          # happy
-    v[6] = (e - 0.85) * 0.30 * g          # surprised, only right at the top
-    v[7] = (0.50 - e) * 1.00 * g          # calm
+    v[0] = (e - 0.35) * 0.45 * g * up        # happy
+    v[6] = (e - 0.85) * 0.30 * g * up        # surprised, only right at the top
+    v[2] = (e - 0.35) * 0.28 * g * down      # sad
+    v[5] = (e - 0.30) * 0.45 * g * down      # melancholic — the weight
+    v[3] = (e - 0.75) * 0.30 * g * down      # afraid, only when stakes are high
+    v[7] = (0.50 - e) * 1.00 * g             # calm, either direction
+    # angry and disgusted stay at zero. This narrates a technical talk; a
+    # presenter who sounds angry about a bottleneck reads as unhinged.
     return [round(min(1.0, max(0.0, x)), 3) for x in v]
 
 
@@ -62,6 +69,41 @@ def call(fn, **kwargs):
     """Pass only what this build of IndexTTS-2 actually accepts."""
     ok = set(inspect.signature(fn).parameters)
     return fn(**{k: v for k, v in kwargs.items() if k in ok})
+
+
+def pacing(e, valence=1.0):
+    """Tempo and inter-phrase silence for a run at energy `e`.
+
+    IndexTTS-2's infer() has no speed argument, so pacing has to be set two
+    other ways. `interval_silence` widens the gaps the model leaves between
+    its own phrases — free, artefact-free, and the thing that stops an
+    opening from sounding rushed. Tempo is a post pass, kept small: under
+    about 8% atempo is transparent, past that it starts to smear.
+
+    Low energy is genuinely slower here. An earlier version routed tempo
+    through the same ease curve as rate, which put a calm opening line at
+    1.045 — asking the quietest part of the talk to outrun the rest.
+    """
+    lo, hi = (float(x) for x in
+              os.environ.get('SM_TEMPO', '0.92:1.05').split(':'))
+    tempo = lo + (hi - lo) * e
+    if e > 0.85:                       # land the payoff, don't sprint it
+        tempo -= (e - 0.85) * 0.20
+    # Weight is slower and leaves more air. Nobody rattles through the part
+    # where they explain what went wrong.
+    down = max(0.0, -valence)
+    tempo -= 0.05 * down
+    silence = int(round(320 - 200 * e + 60 * down))
+    return round(tempo, 3), silence
+
+
+def retempo(src, dst, tempo):
+    """Small pitch-preserving tempo change. Returns the path to use."""
+    if abs(tempo - 1.0) < 0.02:
+        return src
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', src,
+                    '-filter:a', f'atempo={tempo:.3f}', dst], check=True)
+    return dst
 
 
 def main():
@@ -93,6 +135,7 @@ def main():
                model_dir=ckpt, use_fp16=True, use_cuda_kernel=False)
 
     tmp = os.path.join(outdir, '.piece.wav')
+    tmp2 = os.path.join(outdir, '.tempo.wav')
     for slide in plan['slides']:
         if only and slide['slide'] != only:
             continue
@@ -115,7 +158,12 @@ def main():
             jumps = sorted(
                 (abs(segs[i + 1]['energy'] - segs[i]['energy']), i + 1)
                 for i in range(len(segs) - 1))
-            cuts = []
+            # A run must never straddle a change of direction: averaging a
+            # hopeful line with a grim one gives neither. These cuts are
+            # mandatory and are taken before the energy-based ones.
+            cuts = [i + 1 for i in range(len(segs) - 1)
+                    if (segs[i].get('valence', 1.0) < 0) !=
+                       (segs[i + 1].get('valence', 1.0) < 0)]
             for _, idx in reversed(jumps):
                 if len(cuts) >= max_runs - 1:
                     break
@@ -125,37 +173,46 @@ def main():
             runs = []
             for a, b in zip([0] + sorted(cuts), sorted(cuts) + [len(segs)]):
                 part = segs[a:b]
+                if not part:
+                    continue
                 runs.append({'q': sum(s['energy'] for s in part) / len(part),
+                             'v': sum(s.get('valence', 1.0) for s in part) / len(part),
                              'segs': part})
             pieces, sr = [], None
             for r in runs:
-                emo = emotion_vector(r['q'])
+                emo = emotion_vector(r['q'], r['v'])
+                tempo, silence = pacing(r['q'], r['v'])
                 call(tts.infer, spk_audio_prompt=ref,
                      text=' '.join(x['text'] for x in r['segs']),
                      output_path=tmp, emo_vector=emo, emo_alpha=1.0,
-                     verbose=False)
-                w, sr = sf.read(tmp, dtype='float32')
+                     interval_silence=silence, verbose=False)
+                w, sr = sf.read(retempo(tmp, tmp2, tempo), dtype='float32')
                 pieces.append(w if w.ndim == 1 else w.mean(axis=1))
                 gap = r['segs'][-1]['gap']
                 if gap > 0 and r is not runs[-1]:
                     pieces.append(np.zeros(int(gap * sr), dtype=np.float32))
-                print(f"  {slide['slide']} run e={r['q']:.2f} emo={emo} "
+                print(f"  {slide['slide']} run e={r['q']:.2f} v={r['v']:+.2f} emo={emo} "
+                      f"tempo={tempo} sil={silence}ms "
                       f"{len(r['segs'])} sentences", flush=True)
             sf.write(out, np.concatenate(pieces), sr)
             print(f"  {slide['slide']} {len(runs)} runs, {len(segs)} sentences",
                   flush=True)
         elif mode == 'slide':
             e = sum(s['energy'] for s in segs) / len(segs)
-            emo = emotion_vector(e)
+            vv = sum(s.get('valence', 1.0) for s in segs) / len(segs)
+            emo = emotion_vector(e, vv)
+            tempo, silence = pacing(e, vv)
             call(tts.infer, spk_audio_prompt=ref,
                  text=' '.join(s['text'] for s in segs),
-                 output_path=out, emo_vector=emo, emo_alpha=1.0, verbose=False)
-            print(f"  {slide['slide']} e={e:.2f} emo={emo} "
-                  f"one pass, {len(segs)} sentences", flush=True)
+                 output_path=tmp, emo_vector=emo, emo_alpha=1.0,
+                 interval_silence=silence, verbose=False)
+            os.replace(retempo(tmp, tmp2, tempo), out)
+            print(f"  {slide['slide']} e={e:.2f} emo={emo} tempo={tempo} "
+                  f"sil={silence}ms one pass, {len(segs)} sentences", flush=True)
         else:
             pieces, sr = [], None
             for i, seg in enumerate(segs):
-                emo = emotion_vector(seg['energy'])
+                emo = emotion_vector(seg['energy'], seg.get('valence', 1.0))
                 call(tts.infer, spk_audio_prompt=ref, text=seg['text'],
                      output_path=tmp, emo_vector=emo, emo_alpha=1.0,
                      verbose=False)
@@ -167,8 +224,9 @@ def main():
                       f"emo={emo} {seg['text'][:40]}", flush=True)
             sf.write(out, np.concatenate(pieces), sr)
         print(out, flush=True)
-    if os.path.exists(tmp):
-        os.remove(tmp)
+    for f in (tmp, tmp2):
+        if os.path.exists(f):
+            os.remove(f)
 
 
 if __name__ == '__main__':

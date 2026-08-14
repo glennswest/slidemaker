@@ -20,6 +20,20 @@
   drives an emotion vector with the speaker prompt held fixed, the first
   configuration where energy changes without identity changing. `EMO_GAIN`
   scales the axis; `clone ref` cuts a speaker prompt (no transcript needed)
+- **feat:** Valence — energy is "how much", valence is "which way", so a
+  problem section gets weight (sad/melancholic/afraid, and slower with more
+  air) rather than enthusiasm turned down. `[v=-0.8]`, `[problem]`,
+  `[grave]`, `[serious]`, `[bright]`; runs never straddle a change of sign
+- **feat:** Structural energy — sentence length, contrast against the
+  previous sentence, position in the slide and terminal punctuation, so an
+  unmarked script still builds. A short line after a long one is the
+  emphasis the writer already intended
+- **feat:** Arc rendering — a slide is cut at most twice, at its largest
+  energy steps, so the build survives without splicing every sentence
+- **feat:** `curve read` — a local LLM reads the narration and writes the
+  emotional flow to `curve.json` (INCOMPLETE: the request hangs, see
+  CLAUDE.md)
+- **feat:** `EMO_GAIN`, `EMO_RUNS`, `SM_TEMPO` calibration dials
 - **feat:** Energy-band voice cloning — `clone spans SRC`, `clone band`,
   `clone bands`, `clone curve`; the GPU-side renderer loads F5 once for
   the whole deck instead of once per sentence

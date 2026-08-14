@@ -100,8 +100,35 @@ mean / -13.7 peak, matching the take that shipped. energy.wav is no
 longer needed for the excitement path — emotion no longer comes from the
 reference at all.
 
+## Emotion flow from a model that reads the script
+
+Keyword rules cannot do this. The heuristic read "But mixture of experts
+models have a secret" as a problem because it contains "but", when it is
+the pivot into the good news — the exact sentence that should lift.
+
+`slidemaker curve read` sends each slide to a local model (llmpager on
+ai.g8.lo:8090, OpenAI-compatible, qwen3-30b-a3b warm) and stores per
+sentence energy + valence in `narration/curve.json`. Priority: explicit
+[e=..]/[v=..] markers > the model's reading > structural heuristics.
+
+**Unfinished — this is where work stopped.** The annotation request hangs.
+Isolated probes all pass: 800-word prompts, system role, max_tokens=3000,
+temperature 0.2, each fine on their own and answering in ~1s. The full
+annotate payload does not return within 10 minutes. Cause not yet found.
+Next step is to post the exact payload (saved shape in cmd_annotate) with
+curl and watch journalctl on the host, rather than through the tool.
+
+Also unverified: whether qwen3-30b-a3b gives a *good* reading. Nothing has
+been listened to from this path yet.
+
 ## Session Log
 
+- 2026-08-13: IndexTTS-2 backend proven end to end (see above). Added
+  valence, structural energy, arc rendering, and the LLM annotation path
+  (incomplete — request hangs). Paused: ai.g8.lo powered off for the
+  weekend, so every clone/annotate path is offline until it returns.
+  The curve planner, `curve`, `curve init` and the edge-tts path all work
+  with no server.
 - 2026-08-12: Renamed to slidemaker, own repo. Built the excitement
   curve (script markers -> per-sentence energy -> loudness/pauses/rate,
   slew limited) and the energy-band clone path. Curve planner verified
