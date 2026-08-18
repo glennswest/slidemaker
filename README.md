@@ -59,6 +59,40 @@ Two rules the curve encodes, both learned by getting them wrong:
   parameter is slew-rate limited, because a jump between sentences
   sounds like the speaker was swapped.
 
+### Letting a model read the script
+
+Hand-marking every slide is work, and the structural heuristics can only
+count words — they read "But mixture of experts models have a secret" as
+a problem because it contains "but", when it is the pivot into the good
+news. A local model can tell the difference:
+
+```bash
+slidemaker curve read      # writes narration/curve.json
+slidemaker curve           # inspect what it decided, before spending GPU time
+```
+
+It returns an energy and a valence per sentence with a one-word reason,
+and it gets the hard cases right: that pivot comes back as `+1.0
+"pivot"`, and `"Trust the tokenizer."` lifts to `+1.0 "solution"` out of
+a run of tokenizer problems at `-0.3`.
+
+Point `LLM_URL` at any OpenAI-compatible endpoint (`LLM_MODEL` to pick
+the model). Slides are batched `LLM_BATCH` at a time so the model sees
+how consecutive slides relate, and every request carries the same
+`LLM_SESSION` so a server that supports it prefills the shared system
+prompt once per deck rather than per slide.
+
+Two corrections are applied to what comes back, both from watching a real
+deck: the model **ranks** sentences well but compresses the **scale** (70
+of 125 sentences at exactly 0.40), so `E_EXPAND` stretches its readings
+across the deck while preserving every relative judgement; and neutral is
+not flat — a technical talk is mostly neutral sentences, so they keep a
+floor of the bright curve rather than being drained to nothing.
+
+Priority is always: explicit markers in the script > the model's reading
+> the structural heuristics. Marking a sentence by hand overrides
+everything.
+
 ### What the curve cannot do
 
 With a voice clone, a slide is rendered as **one continuous pass**.

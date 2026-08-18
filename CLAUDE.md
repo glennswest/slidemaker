@@ -111,18 +111,45 @@ ai.g8.lo:8090, OpenAI-compatible, qwen3-30b-a3b warm) and stores per
 sentence energy + valence in `narration/curve.json`. Priority: explicit
 [e=..]/[v=..] markers > the model's reading > structural heuristics.
 
-**Unfinished — this is where work stopped.** The annotation request hangs.
-Isolated probes all pass: 800-word prompts, system role, max_tokens=3000,
-temperature 0.2, each fine on their own and answering in ~1s. The full
-annotate payload does not return within 10 minutes. Cause not yet found.
-Next step is to post the exact payload (saved shape in cmd_annotate) with
-curl and watch journalctl on the host, rather than through the tool.
+**Working.** The hang was server-side and is fixed; requests now carry
+`session` so llmpager prefills the shared system prompt once per deck.
+Whole 15-slide deck reads in four requests, ~3 minutes.
 
-Also unverified: whether qwen3-30b-a3b gives a *good* reading. Nothing has
-been listened to from this path yet.
+The reading is good where it matters: "But mixture of experts models have
+a secret" -> +1.0 "pivot" (the heuristic called it a problem because of
+"but"), "Trust the tokenizer." -> +1.0 "solution" among tokenizer
+problems at -0.3, "Virtual memory paging, applied to a trillion
+parameters." -> +1.0 "reveal".
+
+Two corrections were needed on top of it:
+- It ranks well but compresses the scale — 70 of 125 sentences at exactly
+  0.40, one at 0.80. E_EXPAND rescales deck-wide between the 5th and 95th
+  percentiles, preserving its ordering.
+- Neutral is not flat. Gating brightness on max(0, valence) zeroed it for
+  every neutral sentence, and most of a technical talk is neutral.
+  NEUTRAL_LIFT keeps a floor; only negative material fades it.
+
+**Still not heard.** No audio has been rendered from the LLM curve —
+blocked on GPU memory, not on code (see below).
+
+## Sharing the GPU
+
+ai.g8.lo is not slidemaker's to own. Besides the systemd `llmpager`
+unit there is often a hand-started instance (e.g. `--config=/tmp/serve9.json`
+on :8099) holding ~10 GB of the 15.5 GB card. IndexTTS-2 needs ~5.6 GB
+and OOMs by a few MiB against that.
+
+`CLONE_STOP_SERVICE` only knows how to stop the systemd unit, so it
+cannot help here and will stop a service without freeing anything. Do not
+kill processes to make room — ask. A real fix would check free VRAM
+before starting and say what is holding it.
 
 ## Session Log
 
+- 2026-08-18: LLM emotion flow working (llmpager wedge fixed server-side,
+  requests now carry `session`). Added deck-wide range expansion and a
+  neutral-lift floor after the first full-deck read. Nothing rendered yet:
+  IndexTTS-2 OOMs with ~5.7 GB free.
 - 2026-08-13: IndexTTS-2 backend proven end to end (see above). Added
   valence, structural energy, arc rendering, and the LLM annotation path
   (incomplete — request hangs). Paused: ai.g8.lo powered off for the
