@@ -17,6 +17,7 @@ slidemaker init        # writes slidemaker.conf — edit SLIDES etc.
 slidemaker tts         # neural TTS narration (edge-tts)
 slidemaker video       # frames + audio -> video.mp4
 slidemaker pdf         # deck -> PDF
+slidemaker srt         # subtitles from the narration
 ```
 
 The deck is any self-contained HTML whose slides render one at a time

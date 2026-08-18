@@ -23,6 +23,7 @@
 #   clone all N [SET]     synthesize every slide with span N into remote SET
 #   clone fetch [SET]     download a remote SET into voice-SET/
 #   video [DIR [OUT]]     assemble video; audio priority: DIR > VOICE_DIR > tts/
+#   srt [DIR [OUT]]       subtitles from the narration and rendered audio
 #   clean                 remove frames/ tts/ segs/ concat.txt
 set -euo pipefail
 
@@ -48,7 +49,7 @@ conf() {
   TTS_VOICE="${TTS_VOICE:-en-US-AndrewMultilingualNeural}"
   EDGE_TTS_BIN="${EDGE_TTS_BIN:-edge-tts}"
   CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
-  CLONE_HOST="${CLONE_HOST:-}"           # e.g. glenn@ai.g8.lo (empty = cloning off)
+  CLONE_HOST="${CLONE_HOST:-}"           # e.g. glenn@ai.g8.lo; empty = local GPU
   CLONE_DIR="${CLONE_DIR:-voiceclone}"   # remote work dir
   CLONE_VENV="${CLONE_VENV:-\$HOME/.f5venv}"  # remote venv: f5-tts + transformers
   # `CLONE_VENV=~/.f5venv` in a conf file is expanded by the *local* shell at
@@ -227,7 +228,22 @@ cmd_tts() {
 # second copy here drifted once and the markers were spoken aloud.
 strip_markers() { "$PROSODY" strip "$1"; }
 
-clone_ssh() { conf; [ -n "$CLONE_HOST" ] || die "CLONE_HOST not set"; ssh -o BatchMode=yes "$CLONE_HOST" "$@"; }
+# With CLONE_HOST empty the GPU is this machine: run locally and skip the
+# ssh/scp hops entirely. The renderers only ever needed a plan and a
+# working directory, never a remote.
+clone_local() { conf; [ -z "$CLONE_HOST" ]; }
+
+clone_ssh() {
+  conf
+  if clone_local; then bash -c "$*"; return; fi
+  ssh -o BatchMode=yes "$CLONE_HOST" "$@"
+}
+
+# Copy into the work dir, locally or remotely.
+clone_put() {
+  conf; mkdir -p "$CLONE_DIR" 2>/dev/null || true
+  if clone_local; then cp "$1" "$CLONE_DIR/$2"; else scp -q "$1" "$CLONE_HOST:$CLONE_DIR/$2"; fi
+}
 
 cmd_clone() {
   local sub="${1:?usage: slidemaker clone <setup|ship|spans|test|all|fetch>}"; shift || true
@@ -310,7 +326,7 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
     "$PROSODY" json "$@" > "$plan" || die "could not build the plan"
     local nseg; nseg=$(python3 -c "import json,sys; p=json.load(open('$plan')); print(sum(len(s['segments']) for s in p['slides']))")
     echo "plan: $nseg sentences -> $CLONE_HOST ($CLONE_ENGINE)"
-    scp -q "$plan" "$CLONE_HOST:$CLONE_DIR/plan.json"
+    clone_put "$plan" plan.json
     rm -f "$plan"
     local stop="" start="" run=""
     if [ -n "$CLONE_STOP_SERVICE" ]; then
@@ -319,11 +335,11 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
     fi
     case "$CLONE_ENGINE" in
       f5)
-        scp -q "$(dirname "$PROSODY")/slidemaker-clone-curve.py" "$CLONE_HOST:$CLONE_DIR/"
+        clone_put "$(dirname "$PROSODY")/slidemaker-clone-curve.py" slidemaker-clone-curve.py
         run="$CLONE_VENV/bin/python slidemaker-clone-curve.py plan.json $set"
         ;;
       indextts)
-        scp -q "$(dirname "$PROSODY")/slidemaker-clone-indextts.py" "$CLONE_HOST:$CLONE_DIR/"
+        clone_put "$(dirname "$PROSODY")/slidemaker-clone-indextts.py" slidemaker-clone-indextts.py
         # Run from the checkout so the package and checkpoints resolve.
         run="cd \$HOME/$INDEXTTS_DIR && SM_E_VALENCE=${E_VALENCE:-auto} SM_EMO_RUNS=$EMO_RUNS SM_TEMPO=$SM_TEMPO SM_EMO_GAIN=$EMO_GAIN INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF --mode $CLONE_MODE"
         ;;
@@ -332,8 +348,9 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
     gpu_check "$CLONE_ENGINE" || return 1
     clone_ssh "cd $CLONE_DIR && $stop ($run); rc=\$?; $start exit \$rc"
     mkdir -p "voice-$set"
-    scp -q "$CLONE_HOST:$CLONE_DIR/$set/slide*.wav" "voice-$set/"
-    echo "fetched into voice-$set/ — build with: slidemaker video voice-$set"
+    if clone_local; then cp "$CLONE_DIR/$set"/slide*.wav "voice-$set/"
+    else scp -q "$CLONE_HOST:$CLONE_DIR/$set/slide*.wav" "voice-$set/"; fi
+    echo "into voice-$set/ — build with: slidemaker video voice-$set"
     ;;
   test)
     conf; local k="${1:?usage: slidemaker clone test SPAN [SLIDE]}"; local slide="${2:-$SLIDES}"
@@ -378,13 +395,13 @@ engine_vram() { case "$1" in indextts) echo 6000 ;; *) echo 4000 ;; esac; }
 # process it did not start, so this reports and stops.
 gpu_check() {
   local need; need=$(engine_vram "$1")
-  local free
-  free=$(ssh -o BatchMode=yes "$CLONE_HOST" \
-    "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits" 2>/dev/null | head -1)
+  local free q="nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits"
+  if clone_local; then free=$($q 2>/dev/null | head -1)
+  else free=$(ssh -o BatchMode=yes "$CLONE_HOST" "$q" 2>/dev/null | head -1); fi
   [ -n "$free" ] || { echo "slidemaker: could not read GPU memory on $CLONE_HOST" >&2; return 0; }
   [ "$free" -ge "$need" ] && return 0
   echo "slidemaker: $free MiB free on ${CLONE_HOST#*@}, $1 needs ~$need MiB" >&2
-  ssh -o BatchMode=yes "$CLONE_HOST" 'bash -s' >&2 2>/dev/null <<'REMOTE' || true
+  { clone_local && bash -s || ssh -o BatchMode=yes "$CLONE_HOST" 'bash -s'; } >&2 2>/dev/null <<'REMOTE' || true
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader |
 while IFS=, read -r pid mem; do
   pid=${pid// /}
@@ -446,6 +463,62 @@ cmd_video() {
   echo "wrote $out"
 }
 
+# Subtitles straight from the plan: sentence text plus each slide's
+# rendered duration. Cue lengths are apportioned by word count and the
+# planned pauses, which is close enough for narration without dragging in
+# forced alignment.
+cmd_srt() {
+  conf; prosody_env
+  local vdir="${1:-$VOICE_DIR}" out="${2:-${OUT_VIDEO%.mp4}.srt}"
+  local plan; plan=$(mktemp -t slidemaker-plan)
+  "$PROSODY" json > "$plan" || die "could not build the plan"
+  python3 - "$plan" "$vdir" "$VOICE_DIR" "$PAD" "$out" <<'PY'
+import json, subprocess, sys, os
+plan, vdir, voice_dir, pad, out = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), sys.argv[5]
+deck = json.load(open(plan))['slides']
+
+def audio_for(n):
+    for d in (vdir, voice_dir, 'tts'):
+        for ext in ('m4a', 'wav', 'aiff', 'mp3'):
+            p = os.path.join(d, f'slide{n}.{ext}')
+            if os.path.exists(p):
+                return p
+    return None
+
+def stamp(t):
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3600000); m, ms = divmod(ms, 60000); s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+cues, idx, clock = [], 1, 0.0
+for slide in deck:
+    aud = audio_for(slide['slide'])
+    if not aud:
+        continue
+    dur = float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries',
+                                'format=duration', '-of', 'csv=p=0', aud],
+                               capture_output=True, text=True).stdout.strip() or 0)
+    segs = slide['segments']
+    gaps = sum(s['gap'] for s in segs)
+    words = sum(max(1, len(s['text'].split())) for s in segs)
+    # Speech time is whatever the pauses did not take.
+    speech = max(0.1, dur - min(gaps, dur * 0.5))
+    t = clock
+    for s in segs:
+        w = max(1, len(s['text'].split()))
+        span = speech * w / words
+        cues.append((idx, t, t + span, s['text'])); idx += 1
+        t += span + s['gap'] * (min(gaps, dur * 0.5) / gaps if gaps else 0)
+    clock += dur + pad
+
+with open(out, 'w') as fh:
+    for i, a, b, text in cues:
+        fh.write(f"{i}\n{stamp(a)} --> {stamp(b)}\n{text}\n\n")
+print(f"wrote {out} ({len(cues)} cues, {stamp(clock)})")
+PY
+  rm -f "$plan"
+}
+
 cmd_clean() { rm -rf frames tts segs concat.txt; echo cleaned; }
 
 case "${1:-}" in
@@ -459,6 +532,7 @@ case "${1:-}" in
   prosody) shift; cmd_prosody "$@" ;;
   clone) shift; cmd_clone "$@" ;;
   video) shift; cmd_video "$@" ;;
+  srt) shift; cmd_srt "$@" ;;
   clean) shift; cmd_clean "$@" ;;
   version|--version) echo "slidemaker $SLIDEMAKER_VERSION" ;;
   *) grep '^#' "$0" | sed -n '2,25p' | sed 's/^# \{0,1\}//'; exit 1 ;;
