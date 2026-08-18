@@ -80,6 +80,15 @@ conf() {
   # the emotional flow to NARRATION_DIR/curve.json.
   LLM_URL="${LLM_URL:-http://ai.g8.lo:8090/v1/chat/completions}"
   LLM_MODEL="${LLM_MODEL:-qwen3-30b-a3b}"
+  LLM_BATCH="${LLM_BATCH:-4}"            # slides per annotation request
+  LLM_TIMEOUT="${LLM_TIMEOUT:-300}"      # seconds per request
+  # Same session for every request in a deck: the shared system prompt is
+  # prefilled once by the server rather than re-read for each slide.
+  LLM_SESSION="${LLM_SESSION:-slidemaker}"
+  # The model ranks sentences well but compresses the scale; this stretches
+  # its readings deck-wide onto a usable span. Empty keeps them as given.
+  E_EXPAND="${E_EXPAND:-0.25:0.95}"
+  LLM_RESTART="${LLM_RESTART:-}"         # escape hatch, normally empty
   # Loudness is the excitement lever. Rate moves a little and eases back at
   # the peak; pitch barely moves at all — pushing rate and pitch up together
   # is what makes synthetic narration speed up and turn nasal.
@@ -97,7 +106,10 @@ prosody_env() {
          SM_CURVE_FILE="$CURVE_FILE" SM_CURVE_DEFAULT="$CURVE_DEFAULT" \
          SM_E_RATE="$E_RATE" SM_E_PITCH="$E_PITCH" SM_E_VOLUME="$E_VOLUME" \
          SM_E_GAP="$E_GAP" SM_E_JITTER="$E_JITTER" \
-         SM_LLM_URL="$LLM_URL" SM_LLM_MODEL="$LLM_MODEL"
+         SM_LLM_URL="$LLM_URL" SM_LLM_MODEL="$LLM_MODEL" \
+         SM_LLM_BATCH="$LLM_BATCH" SM_LLM_TIMEOUT="$LLM_TIMEOUT" \
+         SM_LLM_SESSION="$LLM_SESSION" SM_LLM_RESTART="$LLM_RESTART" \
+         SM_E_EXPAND="$E_EXPAND"
 }
 
 nn() { printf "%02d" "$1"; }

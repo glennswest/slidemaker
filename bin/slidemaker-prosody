@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -88,6 +89,22 @@ class Config:
             'SM_LLM_URL', 'http://ai.g8.lo:8090/v1/chat/completions')
         self.llm_model = os.environ.get('SM_LLM_MODEL', 'qwen3-30b-a3b')
         self.auto_file = os.environ.get('SM_AUTO_FILE', 'curve.json')
+        # Slides per annotation request. Batching is better anyway — the
+        # model sees how consecutive slides relate — and it also means far
+        # fewer round trips against a server that dislikes them.
+        self.llm_batch = int(os.environ.get('SM_LLM_BATCH', '4'))
+        self.llm_timeout = int(os.environ.get('SM_LLM_TIMEOUT', '300'))
+        # Every annotation request shares one long system prompt. Tagging
+        # them with the same session lets llmpager prefill that prefix once
+        # for the whole deck instead of re-reading it per request.
+        self.llm_session = os.environ.get('SM_LLM_SESSION', 'slidemaker')
+        # The model ranks sentences well but compresses the scale — it
+        # anchors near 0.4 and rarely spends the top of the range. Stretch
+        # its readings across the deck onto a usable span, which preserves
+        # every relative judgement it made. Empty disables.
+        self.expand = os.environ.get('SM_E_EXPAND', '0.25:0.95')
+        # Run before every request. Escape hatch only; normally empty.
+        self.llm_restart = os.environ.get('SM_LLM_RESTART', '')
 
 
 # ------------------------------------------------------- sentence splitting
@@ -238,53 +255,92 @@ Think about the shape of the whole slide: most slides set something up, \
 hit one high point, and settle. Do not give every sentence high energy — \
 if everything is loud, nothing is.
 
-Reply with ONLY a JSON array, one object per sentence, in order:
-[{"i":1,"energy":0.4,"valence":0.0,"why":"setup"}]
+You may be given several slides at once. Read them together — a talk \
+builds across slides, and a line that answers the previous slide's \
+problem should lift. Return every sentence of every slide.
+
+Reply with ONLY a JSON array, one object per sentence, in order, each \
+tagged with its slide:
+[{"slide":"03","i":1,"energy":0.4,"valence":0.0,"why":"setup"}]
 No prose, no markdown fence."""
 
 
-def annotate_slide(cfg, sentences, context=''):
-    """Ask the local model for the emotional flow of one slide."""
+def annotate_batch(cfg, batch, context=''):
+    """Ask the local model for the emotional flow of several slides.
+
+    `batch` is [(key, [sentence, ...]), ...]; returns {key: [row, ...]}.
+    """
     import urllib.request
-    numbered = '\n'.join(f"{i}. {t}" for i, t in enumerate(sentences, 1))
-    body = json.dumps({
+    parts = []
+    for key, sents in batch:
+        numbered = '\n'.join(f"{i}. {t}" for i, t in enumerate(sents, 1))
+        parts.append(f"Slide {key}:\n{numbered}")
+    payload = {
         'model': cfg.llm_model,
         'messages': [{'role': 'system', 'content': ANNOTATE_SYSTEM},
                      {'role': 'user',
                       # /no_think: Qwen3 otherwise spends the whole token
                       # budget reasoning and never reaches the JSON.
-                      'content': f"/no_think\n{context}Sentences:\n{numbered}"}],
+                      'content': f"/no_think\n{context}" + '\n\n'.join(parts)}],
         'temperature': 0.2,
-        'max_tokens': 3000,
-    }).encode()
+        'max_tokens': 4096,
+    }
+    if cfg.llm_session:
+        payload['session'] = cfg.llm_session
+    body = json.dumps(payload).encode()
+    if cfg.llm_restart:
+        subprocess.run(cfg.llm_restart, shell=True, check=False,
+                       capture_output=True)
+        time.sleep(3)
     req = urllib.request.Request(cfg.llm_url, data=body,
                                  headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=600) as fh:
+    with urllib.request.urlopen(req, timeout=cfg.llm_timeout) as fh:
         reply = json.load(fh)['choices'][0]['message']['content']
-    return parse_annotation(reply, len(sentences))
+    return parse_annotation(reply, batch)
 
 
-def parse_annotation(reply, n):
+def parse_annotation(reply, batch):
     """Pull the JSON array out of a reply that may carry <think> and prose."""
     reply = re.sub(r'<think>.*?</think>', '', reply, flags=re.S)
-    m = re.search(r'\[.*\]', reply, re.S)
-    if not m:
+    # The model may answer with one array for the batch or one array per
+    # slide. Decode every top-level array and treat them as one stream, so
+    # both shapes work rather than only the one it happened to use today.
+    rows, dec, pos = [], json.JSONDecoder(), 0
+    while True:
+        start = reply.find('[', pos)
+        if start < 0:
+            break
+        try:
+            val, end = dec.raw_decode(reply, start)
+        except ValueError:
+            pos = start + 1
+            continue
+        if isinstance(val, list):
+            rows.extend(v for v in val if isinstance(v, dict))
+        pos = end
+    if not rows:
         raise ValueError(f"no JSON array in reply: {reply[:200]!r}")
-    rows = json.loads(m.group())
-    out = [None] * n
+    sizes = {key: len(sents) for key, sents in batch}
+    out = {key: [None] * n for key, n in sizes.items()}
+    only = batch[0][0] if len(batch) == 1 else None
     for row in rows:
+        key = str(row.get('slide', only or '')).zfill(2)
+        if key not in out:
+            continue
         i = int(row.get('i', 0)) - 1
-        if 0 <= i < n:
-            out[i] = {'energy': clamp(float(row.get('energy', 0.5))),
-                      'valence': max(-1.0, min(1.0, float(row.get('valence', 0.0)))),
-                      'why': str(row.get('why', ''))[:40]}
+        if 0 <= i < sizes[key]:
+            out[key][i] = {
+                'energy': clamp(float(row.get('energy', 0.5))),
+                'valence': max(-1.0, min(1.0, float(row.get('valence', 0.0)))),
+                'why': str(row.get('why', ''))[:40]}
     # A sentence the model skipped inherits its neighbour rather than a guess.
-    last = {'energy': 0.5, 'valence': 0.0, 'why': 'unset'}
-    for i, v in enumerate(out):
-        if v is None:
-            out[i] = dict(last)
-        else:
-            last = v
+    for key, rowset in out.items():
+        last = {'energy': 0.5, 'valence': 0.0, 'why': 'unset'}
+        for i, v in enumerate(rowset):
+            if v is None:
+                rowset[i] = dict(last)
+            else:
+                last = v
     return out
 
 
@@ -651,7 +707,7 @@ def cmd_plan(cfg, args):
             total_gap += s['gap']
             preview = s['text'] if len(s['text']) <= 58 else s['text'][:55] + '...'
             v = s['valence']
-            mark = '  ' if v > 0.4 else ('▼▼' if v < -0.6 else '▼ ')
+            mark = '▼▼' if v < -0.6 else ('▼ ' if v < -0.2 else '  ')
             print(f"  {bar(s['energy'])} {s['energy']:.2f}{mark}"
                   f"{s['rate']:+3d}% {s['pitch']:+3d}Hz {s['volume']:+2d}% "
                   f"gap {s['gap']:.2f} {s['why']:<10} {preview}")
@@ -662,31 +718,75 @@ def load_auto(cfg):
     path = cfg.narration / cfg.auto_file
     if not path.exists():
         return {}
-    return json.loads(path.read_text())
+    return expand_auto(json.loads(path.read_text()), cfg.expand)
+
+
+def expand_auto(store, spec):
+    """Stretch the model's energies across the deck onto a usable range.
+
+    The reading is compressed, not wrong: on a 125-sentence deck the model
+    put 70 sentences at exactly 0.40 and reached 0.80 once. Its *ordering*
+    is the valuable part, so this rescales rather than re-decides — the
+    5th and 95th percentiles are mapped to the target span (percentiles,
+    not min/max, so one outlier cannot flatten everything else).
+    """
+    if not spec or not store:
+        return store
+    try:
+        lo, hi = (float(x) for x in spec.split(':'))
+    except ValueError:
+        die(f"SM_E_EXPAND must look like LOW:HIGH (got {spec!r})")
+    es = sorted(r['energy'] for rows in store.values() for r in rows)
+    if len(es) < 4:
+        return store
+    p5 = es[max(0, int(len(es) * 0.05))]
+    p95 = es[min(len(es) - 1, int(len(es) * 0.95))]
+    if p95 - p5 < 0.05:
+        return store
+    for rows in store.values():
+        for r in rows:
+            t = (r['energy'] - p5) / (p95 - p5)
+            r['energy'] = clamp(lo + (hi - lo) * t)
+    return store
 
 
 def cmd_annotate(cfg, args):
-    """Have the local model read every slide and write the emotional flow."""
+    """Have the local model read the deck and write the emotional flow."""
     path = cfg.narration / cfg.auto_file
     store = load_auto(cfg) if path.exists() and not args.force else {}
     curve = load_curve(cfg)
+    pending = []
     for i in slide_range(cfg, args):
         key = f"{i:02d}"
         if key in store and not args.force:
             continue
         segs = plan_slide(cfg, i, curve)
-        sents = [s['text'] for s in segs]
-        ctx = (f"This is slide {i} of {cfg.slides} in a technical talk.\n"
+        pending.append((key, [s['text'] for s in segs]))
+    if not pending:
+        print('nothing to do (use --force to re-read)')
+        return
+
+    size = max(1, cfg.llm_batch)
+    for start in range(0, len(pending), size):
+        batch = pending[start:start + size]
+        keys = ', '.join(k for k, _ in batch)
+        ctx = (f"This is a {cfg.slides}-slide technical talk.\n"
                if cfg.slides else '')
+        print(f"reading slides {keys} ...", flush=True)
         try:
-            store[key] = annotate_slide(cfg, sents, ctx)
+            store.update(annotate_batch(cfg, batch, ctx))
         except Exception as exc:
-            die(f"slide {key}: {exc}")
-        lo = min(r['energy'] for r in store[key])
-        hi = max(r['energy'] for r in store[key])
-        neg = sum(1 for r in store[key] if r['valence'] < -0.2)
-        print(f"slide {key}: {len(sents)} sentences, energy {lo:.2f}-{hi:.2f}, "
-              f"{neg} negative", flush=True)
+            # Save what already succeeded — a later slide failing must not
+            # throw away the reading of the earlier ones.
+            path.write_text(json.dumps(store, indent=1) + '\n')
+            die(f"slides {keys}: {exc}  (kept {len(store)} already read)")
+        for key, sents in batch:
+            rows = store[key]
+            lo = min(r['energy'] for r in rows)
+            hi = max(r['energy'] for r in rows)
+            neg = sum(1 for r in rows if r['valence'] < -0.2)
+            print(f"  slide {key}: {len(sents)} sentences, "
+                  f"energy {lo:.2f}-{hi:.2f}, {neg} negative", flush=True)
         path.write_text(json.dumps(store, indent=1) + '\n')
     print(f"wrote {path}")
 

@@ -35,6 +35,11 @@ import soundfile as sf
 # [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]
 EMO_DIMS = 8
 
+# How much of the bright curve a neutral (valence 0) sentence keeps.
+# 0.7 keeps neutral narration at about the body level of the render that
+# was judged right by ear (happy ~0.11) rather than draining it to ~0.05.
+NEUTRAL_LIFT = float(os.environ.get('SM_NEUTRAL_LIFT', '0.7'))
+
 
 def emotion_vector(e, valence=1.0, gain=None):
     """Map one energy value onto the excitement axis of the emotion space.
@@ -52,7 +57,16 @@ def emotion_vector(e, valence=1.0, gain=None):
     guessed at.
     """
     g = float(os.environ.get('SM_EMO_GAIN', '1.0')) if gain is None else gain
-    up, down = max(0.0, valence), max(0.0, -valence)
+    # Neutral is not flat. Gating the bright dimensions on max(0, valence)
+    # zeroes them for every neutral sentence, and a model reading a
+    # technical talk marks most sentences neutral — that alone would drain
+    # the deck. Neutral therefore keeps a floor of the bright curve and
+    # only genuinely negative material fades it out.
+    if valence >= 0.0:
+        up = NEUTRAL_LIFT + (1.0 - NEUTRAL_LIFT) * valence
+    else:
+        up = NEUTRAL_LIFT * (1.0 + valence)      # reaches 0 at valence -1
+    down = max(0.0, -valence)
     v = [0.0] * EMO_DIMS
     v[0] = (e - 0.35) * 0.45 * g * up        # happy
     v[6] = (e - 0.85) * 0.30 * g * up        # surprised, only right at the top
