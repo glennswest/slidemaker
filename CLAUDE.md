@@ -41,11 +41,17 @@ Voice cloning notes (hard-won):
 - [ ] llmpager presentation migrated to slidemaker.conf (thin consumer)
 - [ ] End-to-end rerun on llmpager deck via slidemaker
 
+Open work is tracked as GitHub issues (`gh issue list`), not here:
+- #1 CLONE_STOP_SERVICE assumes it owns the GPU  (blocks hearing the LLM curve)
+- #2 emotion calibration rests on three judgements from one slide
+- #3 edge-tts path still splices into digital silence
+- #4 no tests
+- #5 default CLONE_ENGINE to indextts
+- #6 migrate the llmpager presentation
+- #7 SRT subtitles   #8 backend-used report   #9 local GPU, no ssh
+
 ### M1 — Polish
-- [ ] Per-slide voice mixing report (which backend each slide used)
 - [ ] Background music / intro-outro cards (optional)
-- [ ] Subtitle (SRT) generation from narration files
-- [ ] Local F5-TTS support (no ssh host)
 
 ### M2 — Talking head
 - [ ] Photo + narration audio → animated presenter (SadTalker /
