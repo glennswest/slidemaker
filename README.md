@@ -109,6 +109,18 @@ answer is still to perform it: record the slide yourself and drop it in
 
 ## Your own voice
 
+Two engines, and the choice matters more than any tuning:
+
+- **IndexTTS-2** (default) keeps identity and delivery separate — a
+  speaker prompt fixes who, an emotion vector fixes how — so the
+  excitement curve is a real input.
+- **F5-TTS** takes both from the same reference clip. "Same voice, more
+  excited" is therefore not expressible: asking for more energy means
+  handing it a different reference, which changes who it sounds like.
+  That is architectural, not a tuning problem. Use it when you have a
+  reference set you like, but expect the curve to do little beyond
+  choosing a band.
+
 Best-quality path, learned the hard way:
 
 1. **Record ~3 minutes** of natural reading — phone Voice Memos in a

@@ -61,7 +61,7 @@ conf() {
   #            the curve can only pick a reference per slide.
   # indextts — speaker prompt and emotion vector are separate inputs, so the
   #            curve drives emotion with your voice held fixed.
-  CLONE_ENGINE="${CLONE_ENGINE:-f5}"     # f5 | indextts
+  CLONE_ENGINE="${CLONE_ENGINE:-indextts}"  # indextts | f5
   INDEXTTS_DIR="${INDEXTTS_DIR:-index-tts}"   # checkout on CLONE_HOST
   CLONE_REF="${CLONE_REF:-refs/speaker.wav}"  # speaker prompt (indextts)
   CLONE_MODE="${CLONE_MODE:-slide}"      # slide | arc | sentence (indextts)
@@ -329,6 +329,7 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
         ;;
       *) die "CLONE_ENGINE must be f5 or indextts (got $CLONE_ENGINE)" ;;
     esac
+    gpu_check "$CLONE_ENGINE" || return 1
     clone_ssh "cd $CLONE_DIR && $stop ($run); rc=\$?; $start exit \$rc"
     mkdir -p "voice-$set"
     scp -q "$CLONE_HOST:$CLONE_DIR/$set/slide*.wav" "voice-$set/"
@@ -368,11 +369,38 @@ open('reftext.txt','w').write(c[2])\" && mkdir -p $set && for f in narration/sli
   esac
 }
 
+# Free VRAM needed per engine, MiB. Measured, not guessed: IndexTTS-2
+# peaked at 5.55 GiB and then died asking for 20 MiB more.
+engine_vram() { case "$1" in indextts) echo 6000 ;; *) echo 4000 ;; esac; }
+
+# Refuse to start a render that cannot fit, and say what is holding the
+# card. slidemaker does not own this GPU: it must never kill or stop a
+# process it did not start, so this reports and stops.
+gpu_check() {
+  local need; need=$(engine_vram "$1")
+  local free
+  free=$(ssh -o BatchMode=yes "$CLONE_HOST" \
+    "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits" 2>/dev/null | head -1)
+  [ -n "$free" ] || { echo "slidemaker: could not read GPU memory on $CLONE_HOST" >&2; return 0; }
+  [ "$free" -ge "$need" ] && return 0
+  echo "slidemaker: $free MiB free on ${CLONE_HOST#*@}, $1 needs ~$need MiB" >&2
+  ssh -o BatchMode=yes "$CLONE_HOST" 'bash -s' >&2 2>/dev/null <<'REMOTE' || true
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader |
+while IFS=, read -r pid mem; do
+  pid=${pid// /}
+  printf '  pid %-8s %10s  %s\n' "$pid" "${mem# }" "$(ps -o cmd= -p "$pid" 2>/dev/null | cut -c1-58)"
+done
+REMOTE
+  echo "slidemaker: free memory on that GPU and retry — slidemaker will not stop what it did not start" >&2
+  return 1
+}
+
 cmd_video() {
   conf
   local vdir="${1:-$VOICE_DIR}" out="${2:-$OUT_VIDEO}"
   cmd_render >/dev/null
   mkdir -p segs; rm -f segs/*.mp4 concat.txt
+  local used="" src=
   for i in $(seq 1 "$SLIDES"); do
     local n; n=$(nn "$i") aud=""
     for ext in m4a wav aiff mp3; do
@@ -387,6 +415,13 @@ cmd_video() {
       [ -f "tts/slide$n.$ext" ] && aud="tts/slide$n.$ext" && break
     done
     [ -n "$aud" ] || die "no audio for slide $n (run slidemaker tts, or add $vdir/slide$n.*)"
+    case "$aud" in
+      "$vdir"/*)       src=cloned  ;;
+      "$VOICE_DIR"/*)  src=recorded ;;
+      tts/*)           src=tts     ;;
+      *)               src=other   ;;
+    esac
+    used="$used $src"
     local dur total
     dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$aud")
     total=$(python3 -c "print(f'{float('$dur') + $PAD:.2f}')")
@@ -398,12 +433,16 @@ cmd_video() {
       -c:v libx264 -tune stillimage -pix_fmt yuv420p -r 30 \
       -c:a aac -b:a 192k -ar 48000 "segs/slide$n.mp4"
     echo "file 'segs/slide$n.mp4'" >> concat.txt
-    echo "slide $n: ${total}s ($aud)"
+    printf 'slide %s: %6ss  %-8s %s\n' "$n" "$total" "$src" "$aud"
   done
   # Video segments are codec-identical (copy); audio is re-encoded into one
   # continuous stream so AAC priming gaps can't click at slide boundaries.
   ffmpeg -v error -y -f concat -safe 0 -i concat.txt -c:v copy -c:a aac -b:a 192k "$out"
   ffprobe -v error -show_entries format=duration,size -of default=nw=1 "$out"
+  # Which backend actually spoke each slide. A slide that quietly fell
+  # back to TTS on a deck of recordings is otherwise invisible.
+  echo "voices: $(for v in $used; do echo "$v"; done | sort | uniq -c \
+    | awk '{printf "%s %s  ", $1, $2}')"
   echo "wrote $out"
 }
 

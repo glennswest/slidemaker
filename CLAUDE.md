@@ -42,13 +42,13 @@ Voice cloning notes (hard-won):
 - [ ] End-to-end rerun on llmpager deck via slidemaker
 
 Open work is tracked as GitHub issues (`gh issue list`), not here:
-- #1 CLONE_STOP_SERVICE assumes it owns the GPU  (blocks hearing the LLM curve)
+- #1 CLONE_STOP_SERVICE assumes it owns the GPU  (done: VRAM preflight)
 - #2 emotion calibration rests on three judgements from one slide
 - #3 edge-tts path still splices into digital silence
-- #4 no tests
-- #5 default CLONE_ENGINE to indextts
+- #4 no tests  (done: tests/test_prosody.py, 41 cases)
+- #5 default CLONE_ENGINE to indextts  (done)
 - #6 migrate the llmpager presentation
-- #7 SRT subtitles   #8 backend-used report   #9 local GPU, no ssh
+- #7 SRT subtitles   #8 backend-used report (done)   #9 local GPU, no ssh
 
 ### M1 — Polish
 - [ ] Background music / intro-outro cards (optional)
