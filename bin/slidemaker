@@ -66,6 +66,11 @@ conf() {
   INDEXTTS_DIR="${INDEXTTS_DIR:-index-tts}"   # checkout on CLONE_HOST
   CLONE_REF="${CLONE_REF:-refs/speaker.wav}"  # speaker prompt (indextts)
   CLONE_MODE="${CLONE_MODE:-slide}"      # slide | arc | sentence (indextts)
+  # A neighbour on the same GPU that can shrink on request rather than be
+  # stopped, e.g. http://ai.g8.lo:8090 (llmpager >= 0.19). Borrowed VRAM is
+  # always given back, including on interrupt.
+  GPU_LENDER="${GPU_LENDER:-}"
+  GPU_LENT_SLOTS=""
   # Scales the whole emotion axis. The usable range is narrow: 1.0 puts full
   # curve energy at about happy=0.30, which is a lift, not a performance.
   EMO_GAIN="${EMO_GAIN:-1.6}"
@@ -341,12 +346,14 @@ print('$name <- $src span $k  %.1fs  %s' % (c[1]-c[0], c[2][:60]))\""
       indextts)
         clone_put "$(dirname "$PROSODY")/slidemaker-clone-indextts.py" slidemaker-clone-indextts.py
         # Run from the checkout so the package and checkpoints resolve.
-        run="cd \$HOME/$INDEXTTS_DIR && SM_E_VALENCE=${E_VALENCE:-auto} SM_EMO_RUNS=$EMO_RUNS SM_TEMPO=$SM_TEMPO SM_EMO_GAIN=$EMO_GAIN INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF --mode $CLONE_MODE"
+        run="cd \$HOME/$INDEXTTS_DIR && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True SM_E_VALENCE=${E_VALENCE:-auto} SM_EMO_RUNS=$EMO_RUNS SM_TEMPO=$SM_TEMPO SM_EMO_GAIN=$EMO_GAIN INDEXTTS_CKPT=\$HOME/$INDEXTTS_DIR/checkpoints \$HOME/.local/bin/uv run python \$HOME/$CLONE_DIR/slidemaker-clone-indextts.py \$HOME/$CLONE_DIR/plan.json \$HOME/$CLONE_DIR/$set --ref \$HOME/$CLONE_DIR/$CLONE_REF --mode $CLONE_MODE"
         ;;
       *) die "CLONE_ENGINE must be f5 or indextts (got $CLONE_ENGINE)" ;;
     esac
     gpu_check "$CLONE_ENGINE" || return 1
+    trap 'gpu_return' EXIT INT TERM
     clone_ssh "cd $CLONE_DIR && $stop ($run); rc=\$?; $start exit \$rc"
+    gpu_return; trap - EXIT INT TERM
     mkdir -p "voice-$set"
     if clone_local; then cp "$CLONE_DIR/$set"/slide*.wav "voice-$set/"
     else scp -q "$CLONE_HOST:$CLONE_DIR/$set/slide*.wav" "voice-$set/"; fi
@@ -388,7 +395,7 @@ open('reftext.txt','w').write(c[2])\" && mkdir -p $set && for f in narration/sli
 
 # Free VRAM needed per engine, MiB. Measured, not guessed: IndexTTS-2
 # peaked at 5.55 GiB and then died asking for 20 MiB more.
-engine_vram() { case "$1" in indextts) echo 6000 ;; *) echo 4000 ;; esac; }
+engine_vram() { case "$1" in indextts) echo 7500 ;; *) echo 4000 ;; esac; }
 
 # Refuse to start a render that cannot fit, and say what is holding the
 # card. slidemaker does not own this GPU: it must never kill or stop a
@@ -400,6 +407,14 @@ gpu_check() {
   else free=$(ssh -o BatchMode=yes "$CLONE_HOST" "$q" 2>/dev/null | head -1); fi
   [ -n "$free" ] || { echo "slidemaker: could not read GPU memory on $CLONE_HOST" >&2; return 0; }
   [ "$free" -ge "$need" ] && return 0
+  # A neighbour may be willing to shrink rather than be stopped.
+  if gpu_borrow "$need"; then
+    if clone_local; then free=$($q 2>/dev/null | head -1)
+    else free=$(ssh -o BatchMode=yes "$CLONE_HOST" "$q" 2>/dev/null | head -1); fi
+    [ -n "$free" ] && [ "$free" -ge "$need" ] && return 0
+    echo "slidemaker: still only ${free:-?} MiB free after asking" >&2
+    gpu_return >&2
+  fi
   echo "slidemaker: $free MiB free on ${CLONE_HOST#*@}, $1 needs ~$need MiB" >&2
   { clone_local && bash -s || ssh -o BatchMode=yes "$CLONE_HOST" 'bash -s'; } >&2 2>/dev/null <<'REMOTE' || true
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader |
@@ -409,7 +424,43 @@ while IFS=, read -r pid mem; do
 done
 REMOTE
   echo "slidemaker: free memory on that GPU and retry — slidemaker will not stop what it did not start" >&2
+  [ -n "$GPU_LENDER" ] && echo "slidemaker: or let it borrow: GPU_LENDER=$GPU_LENDER (asked for ${need} MiB)" >&2
   return 1
+}
+
+# Borrow VRAM from a neighbour that can shrink on request, instead of
+# stopping it. llmpager >= 0.19 exposes this; anything with the same two
+# endpoints works. Returns 0 if it borrowed (so the caller knows to give
+# it back), 1 otherwise.
+gpu_borrow() {
+  [ -n "$GPU_LENDER" ] || return 1
+  local need="$1" head
+  head=$(curl -s -m 10 "$GPU_LENDER/v1/admin/vram") || return 1
+  GPU_LENT_SLOTS=$(printf '%s' "$head" | python3 -c "
+import json,sys
+try: print(json.load(sys.stdin)['warm'][0]['slots'])
+except Exception: print('')" 2>/dev/null)
+  [ -n "$GPU_LENT_SLOTS" ] || return 1
+  # nvidia-smi reports slightly less free than the lender does, so asking
+  # for exactly `need` lands just short of the bar we then check against.
+  local ask=$((need + 600))
+  echo "slidemaker: asking $GPU_LENDER for ${ask} MiB (it holds ${GPU_LENT_SLOTS} slots)"
+  curl -s -m 120 -X POST "$GPU_LENDER/v1/admin/slots" \
+    -H 'Content-Type: application/json' -d "{\"reserve_mb\":$ask}" >/dev/null || return 1
+  return 0
+}
+
+# Give back exactly what was borrowed. The reserve is a floor and clamps
+# any later target, so it must be cleared before the slot count is
+# restored — otherwise the restore is silently ignored.
+gpu_return() {
+  [ -n "$GPU_LENDER" ] && [ -n "${GPU_LENT_SLOTS:-}" ] || return 0
+  curl -s -m 120 -X POST "$GPU_LENDER/v1/admin/slots" \
+    -H 'Content-Type: application/json' -d '{"reserve_mb":500}' >/dev/null || true
+  curl -s -m 120 -X POST "$GPU_LENDER/v1/admin/slots" \
+    -H 'Content-Type: application/json' -d "{\"target\":$GPU_LENT_SLOTS}" >/dev/null || true
+  echo "slidemaker: returned $GPU_LENDER to ${GPU_LENT_SLOTS} slots"
+  GPU_LENT_SLOTS=""
 }
 
 cmd_video() {

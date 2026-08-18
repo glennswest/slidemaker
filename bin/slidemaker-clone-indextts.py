@@ -80,7 +80,15 @@ def emotion_vector(e, valence=1.0, gain=None):
 def call(fn, **kwargs):
     """Pass only what this build of IndexTTS-2 actually accepts."""
     ok = set(inspect.signature(fn).parameters)
-    return fn(**{k: v for k, v in kwargs.items() if k in ok})
+    out = fn(**{k: v for k, v in kwargs.items() if k in ok})
+    # Cached blocks are not returned between calls, so device memory grows
+    # run over run and a long deck OOMs on its own — worse when sharing the
+    # card. Hand them back after every synthesis.
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return out
 
 
 def pacing(e, valence=1.0):
@@ -174,9 +182,10 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     print(f"speaker prompt: {ref}", flush=True)
 
-    global np, sf
+    global np, sf, torch
     import numpy as np
     import soundfile as sf
+    import torch
     from indextts.infer_v2 import IndexTTS2
     here = os.path.dirname(os.path.abspath(__file__))
     ckpt = os.environ.get('INDEXTTS_CKPT', os.path.join(here, 'checkpoints'))

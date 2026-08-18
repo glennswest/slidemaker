@@ -44,7 +44,7 @@ Voice cloning notes (hard-won):
 Open work is tracked as GitHub issues (`gh issue list`), not here:
 - #1 CLONE_STOP_SERVICE assumes it owns the GPU  (done: VRAM preflight)
 - #2 emotion calibration rests on three judgements from one slide
-- #3 edge-tts path still splices into digital silence
+- #3 edge-tts path still splices into digital silence (done: run grouping)
 - #4 no tests  (done: tests/test_prosody.py, 41 cases)
 - #5 default CLONE_ENGINE to indextts  (done)
 - #6 migrate the llmpager presentation

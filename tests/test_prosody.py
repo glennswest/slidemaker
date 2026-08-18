@@ -277,6 +277,44 @@ class Pacing(unittest.TestCase):
     def test_weight_slows_further(self):
         self.assertLess(idx.pacing(0.6, -1.0)[0], idx.pacing(0.6, 1.0)[0])
 
+class SynthRuns(unittest.TestCase):
+    """Grouping for the neural-TTS path (issue #3)."""
+
+    def seg(self, e, gap=0.2, beat=0.0, text='A sentence here.', jit=0):
+        return {'energy': e, 'rate': 5 + jit, 'pitch': 2 + jit, 'volume': 3,
+                'gap': gap, 'beat': beat, 'text': text}
+
+    def test_similar_energy_merges(self):
+        runs = pros.synth_runs([self.seg(0.5) for _ in range(4)])
+        self.assertEqual(len(runs), 1)
+
+    def test_jitter_does_not_prevent_merging(self):
+        # Per-sentence jitter and run grouping would otherwise cancel out.
+        segs = [self.seg(0.5, jit=j) for j in (0, 1, -1, 2)]
+        self.assertEqual(len(pros.synth_runs(segs)), 1)
+
+    def test_distant_energy_splits(self):
+        self.assertEqual(len(pros.synth_runs([self.seg(0.2), self.seg(0.9)])), 2)
+
+    def test_a_beat_ends_a_run(self):
+        segs = [self.seg(0.5, beat=0.8), self.seg(0.5)]
+        self.assertEqual(len(pros.synth_runs(segs)), 2)
+
+    def test_run_gap_is_the_last_sentence_gap(self):
+        segs = [self.seg(0.5, gap=0.2), self.seg(0.5, gap=0.9)]
+        self.assertAlmostEqual(pros.synth_runs(segs)[0]['gap'], 0.9)
+
+    def test_run_settings_are_the_mean(self):
+        segs = [self.seg(0.5, jit=0), self.seg(0.5, jit=2)]
+        self.assertEqual(pros.synth_runs(segs)[0]['rate'], 6)
+
+    def test_no_text_is_lost(self):
+        segs = [self.seg(0.5, text=f'Sentence number {i}.') for i in range(6)]
+        segs[3]['energy'] = 0.95
+        joined = ' '.join(r['text'] for r in pros.synth_runs(segs))
+        for i in range(6):
+            self.assertIn(f'Sentence number {i}.', joined)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=1)

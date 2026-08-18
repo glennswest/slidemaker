@@ -149,6 +149,22 @@ yourself overrides synthesis for that slide.
 - The reference span *is* the personality: generate candidates from
   different parts of your sample and listen before committing.
 
+## Sharing a GPU
+
+slidemaker does not own the machine it renders on. Before a clone render
+it checks free VRAM and, if there is not enough, says what is holding the
+card and stops — it will never kill or stop a process it did not start.
+
+If a neighbour can shrink on request, point `GPU_LENDER` at it and
+slidemaker will borrow instead:
+
+```
+GPU_LENDER=http://ai.g8.lo:8090      # llmpager >= 0.19
+```
+
+It asks for the headroom it needs, renders, and gives the memory back
+afterwards — including when interrupted.
+
 ## Requirements
 
 - macOS host: ffmpeg, Google Chrome, python3; `pip install edge-tts`

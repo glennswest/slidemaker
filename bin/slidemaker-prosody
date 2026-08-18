@@ -661,17 +661,53 @@ def edge_args(cfg, seg):
             '--text', seg['text']]
 
 
+def synth_runs(segs, step=None):
+    """Group consecutive sentences of similar energy into continuous runs.
+
+    Rendering every sentence separately restarts the intonation contour at
+    each join, which is the construction that reads as spliced. Sentences
+    close in energy can be spoken in one call instead.
+
+    Grouping is on *energy*, not on the final rate/pitch/volume, because
+    the per-sentence jitter that keeps settings from being identical would
+    otherwise prevent almost every merge — the two features would cancel
+    out, and splicing is the worse fault of the two. Each run then speaks
+    at its own mean settings, so the jitter survives at run granularity.
+
+    A deliberate [beat] always ends a run: the silence the author asked
+    for must not be swallowed inside one.
+    """
+    if step is None:
+        step = float(os.environ.get('SM_E_RUN_STEP', '0.12'))
+    runs = []
+    for seg in segs:
+        prev = runs[-1] if runs else None
+        if (prev and abs(seg['energy'] - prev['segs'][0]['energy']) <= step
+                and prev['segs'][-1]['beat'] == 0):
+            prev['segs'].append(seg)
+        else:
+            runs.append({'segs': [seg]})
+    for r in runs:
+        part = r['segs']
+        r['text'] = ' '.join(x['text'] for x in part)
+        r['gap'] = part[-1]['gap']
+        r['energy'] = sum(x['energy'] for x in part) / len(part)
+        for k in ('rate', 'pitch', 'volume'):
+            r[k] = round(sum(x[k] for x in part) / len(part))
+    return runs
+
+
 def synth_slide(cfg, index, segs, out_path):
-    """Synthesize each sentence, then join with the planned silences."""
+    """Synthesize the slide in runs, then join with the planned silences."""
     with tempfile.TemporaryDirectory(prefix='slidemaker-') as tmp:
         tmp = Path(tmp)
         parts = []          # ffmpeg inputs, in order
-        for i, seg in enumerate(segs):
+        for i, seg in enumerate(synth_runs(segs)):
             piece = tmp / f"{i:03d}.mp3"
             cmd = edge_args(cfg, seg) + ['--write-media', str(piece)]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0 or not piece.exists() or piece.stat().st_size == 0:
-                die(f"edge-tts failed on slide {index:02d} sentence {i + 1}:\n"
+                die(f"edge-tts failed on slide {index:02d} run {i + 1}:\n"
                     f"  {seg['text'][:70]}\n  {proc.stderr.strip()[:300]}")
             parts.append(('file', piece))
             if seg['gap'] > 0:
@@ -855,7 +891,8 @@ def cmd_synth(cfg, args):
         write_plan(cfg.tts_dir / f"slide{i:02d}.plan.tsv", segs)
         lo = min(s['energy'] for s in segs)
         hi = max(s['energy'] for s in segs)
-        print(f"{out}  ({len(segs)} sentences, energy {lo:.2f}–{hi:.2f})")
+        print(f"{out}  ({len(segs)} sentences in {len(synth_runs(segs))} "
+              f"runs, energy {lo:.2f}–{hi:.2f})")
 
 
 def cmd_curve_init(cfg, args):
