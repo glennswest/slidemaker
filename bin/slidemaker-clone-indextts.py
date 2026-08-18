@@ -29,8 +29,6 @@ import os
 import subprocess
 import sys
 
-import numpy as np
-import soundfile as sf
 
 # [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]
 EMO_DIMS = 8
@@ -111,6 +109,40 @@ def pacing(e, valence=1.0):
     return round(tempo, 3), silence
 
 
+def split_runs(segs, max_runs):
+    """Group a slide's sentences into at most `max_runs` continuous runs.
+
+    Cuts are mandatory where valence changes sign — averaging a hopeful
+    line with a grim one gives neither — and otherwise fall at the largest
+    energy steps. No run is shorter than two sentences, so a slide never
+    degenerates into per-sentence splicing.
+    """
+    if not segs:
+        return []
+    cuts = [i + 1 for i in range(len(segs) - 1)
+            if (segs[i].get('valence', 1.0) < 0) !=
+               (segs[i + 1].get('valence', 1.0) < 0)]
+    jumps = sorted((abs(segs[i + 1]['energy'] - segs[i]['energy']), i + 1)
+                   for i in range(len(segs) - 1))
+    for _, idx in reversed(jumps):
+        if len(cuts) >= max(1, max_runs) - 1:
+            break
+        if idx in cuts:
+            continue
+        edges = sorted(cuts + [idx, 0, len(segs)])
+        if min(b - a for a, b in zip(edges, edges[1:])) >= 2:
+            cuts.append(idx)
+    runs = []
+    for a, b in zip([0] + sorted(cuts), sorted(cuts) + [len(segs)]):
+        part = segs[a:b]
+        if part:
+            runs.append({
+                'q': sum(x['energy'] for x in part) / len(part),
+                'v': sum(x.get('valence', 1.0) for x in part) / len(part),
+                'segs': part})
+    return runs
+
+
 def retempo(src, dst, tempo):
     """Small pitch-preserving tempo change. Returns the path to use."""
     if abs(tempo - 1.0) < 0.02:
@@ -142,6 +174,9 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     print(f"speaker prompt: {ref}", flush=True)
 
+    global np, sf
+    import numpy as np
+    import soundfile as sf
     from indextts.infer_v2 import IndexTTS2
     here = os.path.dirname(os.path.abspath(__file__))
     ckpt = os.environ.get('INDEXTTS_CKPT', os.path.join(here, 'checkpoints'))
@@ -168,30 +203,7 @@ def main():
             # most SM_EMO_RUNS-1 times, at the biggest energy steps in the
             # slide, keeping every run at least two sentences long. Each run
             # then speaks at its own mean energy.
-            max_runs = int(os.environ.get('SM_EMO_RUNS', '3'))
-            jumps = sorted(
-                (abs(segs[i + 1]['energy'] - segs[i]['energy']), i + 1)
-                for i in range(len(segs) - 1))
-            # A run must never straddle a change of direction: averaging a
-            # hopeful line with a grim one gives neither. These cuts are
-            # mandatory and are taken before the energy-based ones.
-            cuts = [i + 1 for i in range(len(segs) - 1)
-                    if (segs[i].get('valence', 1.0) < 0) !=
-                       (segs[i + 1].get('valence', 1.0) < 0)]
-            for _, idx in reversed(jumps):
-                if len(cuts) >= max_runs - 1:
-                    break
-                edges = sorted(cuts + [idx, 0, len(segs)])
-                if min(b - a for a, b in zip(edges, edges[1:])) >= 2:
-                    cuts.append(idx)
-            runs = []
-            for a, b in zip([0] + sorted(cuts), sorted(cuts) + [len(segs)]):
-                part = segs[a:b]
-                if not part:
-                    continue
-                runs.append({'q': sum(s['energy'] for s in part) / len(part),
-                             'v': sum(s.get('valence', 1.0) for s in part) / len(part),
-                             'segs': part})
+            runs = split_runs(segs, int(os.environ.get('SM_EMO_RUNS', '3')))
             pieces, sr = [], None
             for r in runs:
                 emo = emotion_vector(r['q'], r['v'])

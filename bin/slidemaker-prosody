@@ -168,7 +168,7 @@ def _cap_length(sentence, max_words):
 # Energy is "how much", valence is "which way". A talk is not one axis:
 # the problem section needs weight, not enthusiasm turned down.
 MARKER = re.compile(
-    r'\[\s*(?:e\s*=\s*(?P<e1>[0-9]*\.?[0-9]+)\s*(?:>\s*(?P<e2>[0-9]*\.?[0-9]+))?'
+    r'\[\s*(?:e\s*=\s*(?P<e1>[+-]?[0-9]*\.?[0-9]+)\s*(?:>\s*(?P<e2>[+-]?[0-9]*\.?[0-9]+))?'
     r'|v\s*=\s*(?P<val>[+-]?[0-9]*\.?[0-9]+)'
     r'|(?P<tone>problem|grave|serious|bright)'
     r'|beat(?:\s*=\s*(?P<beat>[0-9]*\.?[0-9]+))?)\s*\]', re.I)
@@ -177,6 +177,21 @@ TONES = {'problem': -0.75, 'grave': -0.9, 'serious': -0.5, 'bright': 1.0}
 
 # Words that mark the part of a talk where something is wrong. Used only
 # when SM_E_VALENCE=auto and the sentence carries no explicit marker.
+# Anything else in square brackets is a typo or an unsupported directive.
+# It must never reach the synthesizer: a mistyped marker would otherwise be
+# read out loud, and it also breaks sentence splitting, since a sentence
+# starting with "[" is not treated as a boundary.
+UNKNOWN_MARKER = re.compile(r'\[[^\]\n]{0,40}\]')
+
+
+def drop_unknown(text, seen=None):
+    def note(m):
+        if seen is not None:
+            seen.append(m.group())
+        return ''
+    return UNKNOWN_MARKER.sub(note, text)
+
+
 PROBLEM_WORDS = re.compile(
     r'\b(problem|problems|fails?|failed|failure|broken|breaks?|wrong|'
     r"can't|cannot|doesn't|does not|won't|didn't|no way|impossible|"
@@ -370,8 +385,10 @@ def build_segments(text, base):
     span = 0
     pos = 0
     valence = [1.0]     # current valence, mutable across the emit closure
+    junk = []           # unrecognised bracket directives, reported below
 
     def emit(chunk):
+        chunk = drop_unknown(chunk, junk)
         paras = re.split(r'\n\s*\n', chunk)
         for pi, para in enumerate(paras):
             sents = split_sentences(para, CFG.max_words)
@@ -402,6 +419,9 @@ def build_segments(text, base):
                 items[-1]['beat'] = max(items[-1]['beat'], secs)
     emit(text[pos:])
 
+    if junk:
+        print(f"slidemaker: ignored unrecognised marker(s): {' '.join(junk)}",
+              file=sys.stderr)
     items = _merge_fragments(items)
     if not items:
         return items
@@ -791,6 +811,21 @@ def cmd_annotate(cfg, args):
     print(f"wrote {path}")
 
 
+def cmd_strip(cfg, args):
+    """Print narration with the curve markers removed.
+
+    The marker syntax must be defined in exactly one place. Backends that
+    read a narration file verbatim (macOS `say`, EXCITEMENT=off) route
+    through here rather than carrying their own copy of the pattern — an
+    earlier duplicate in shell drifted and the markers were read aloud.
+    """
+    src = Path(args.file)
+    if not src.exists():
+        die(f"no such file: {src}")
+    text = drop_unknown(MARKER.sub('', src.read_text()))
+    sys.stdout.write(re.sub(r'[ \t]+', ' ', text))
+
+
 def cmd_json(cfg, args):
     """Emit the whole deck plan for the voice-clone renderer on the GPU host."""
     curve = load_curve(cfg)
@@ -916,11 +951,13 @@ def main():
         p.add_argument('--force', action='store_true')
         if name == 'report':
             p.add_argument('dir', nargs='?')
+    sp = sub.add_parser('strip')
+    sp.add_argument('file')
     args = ap.parse_args()
     CFG = Config()
     {'plan': cmd_plan, 'json': cmd_json, 'synth': cmd_synth,
      'report': cmd_report, 'curve-init': cmd_curve_init,
-     'annotate': cmd_annotate}[args.cmd](CFG, args)
+     'annotate': cmd_annotate, 'strip': cmd_strip}[args.cmd](CFG, args)
 
 
 CFG = Config()

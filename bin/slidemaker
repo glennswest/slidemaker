@@ -223,10 +223,9 @@ cmd_tts() {
   done
 }
 
-# Remove [e=..] / [e=A>B] / [beat..] markers, leaving clean narration text.
-strip_markers() {
-  sed -E 's/\[[[:space:]]*(e[[:space:]]*=[[:space:]]*[0-9.]+([[:space:]]*>[[:space:]]*[0-9.]+)?|v[[:space:]]*=[[:space:]]*[+-]?[0-9.]+|problem|grave|serious|bright|beat([[:space:]]*=[[:space:]]*[0-9.]+)?)[[:space:]]*\]//gI' "$1"
-}
+# Strip curve markers. The pattern lives in slidemaker-prosody only — a
+# second copy here drifted once and the markers were spoken aloud.
+strip_markers() { "$PROSODY" strip "$1"; }
 
 clone_ssh() { conf; [ -n "$CLONE_HOST" ] || die "CLONE_HOST not set"; ssh -o BatchMode=yes "$CLONE_HOST" "$@"; }
 
